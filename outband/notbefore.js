@@ -3,9 +3,10 @@
  *
  * Sessions and tokens issued before a user's `not_before` are refused.
  * `not_before` advances only on a real credential change: a new password
- * (MeshCentral moves `passchange` forward whenever a password is set, by the
- * user, an administrator, a reset link or the command line), or a "change at
- * next login" reset (`passchange` = -1). Lock state is checked separately on
+ * (MeshCentral sets `passchange` to the current time whenever a password is
+ * set, by the user, an administrator, a reset link or the command line), or a
+ * "change at next login" reset (`passchange` = -1), including a user first
+ * seen while a reset is pending. Lock state is checked separately on
  * every request (see auth.js).
  *
  * The stored credential state is derived from `passchange` only, never from
@@ -51,10 +52,16 @@ function parseState(fp) {
     return isFinite(n) ? n : 0;
 }
 
-/** True when moving from state `prev` to `cur` is a credential change. */
+/**
+ * True when moving from state `prev` to `cur` is a credential change: a reset
+ * requested, `passchange` set to a different positive value, or a positive
+ * `passchange` removed (fail closed). A backward move counts too, so a new
+ * password stamped by a server with a clock behind is not missed.
+ */
 function isCredentialChange(prev, cur) {
     if (cur === -1) return (prev !== -1); // reset requested
-    return (cur > 0) && (cur > prev); // a new password: passchange moved forward (including out of a reset)
+    if (cur === 0) return (prev > 0); // a positive passchange removed: fail closed
+    return (cur !== prev); // a new password (including out of a reset)
 }
 
 /** The earlier stored format (hash of salt, hash, passtype and the reset flag), used once to migrate. */
@@ -64,7 +71,11 @@ function legacyFingerprint(user) {
 }
 
 class NotBefore {
-    constructor(store, bus) { this.store = store; this.bus = bus; this.map = new Map(); this.timer = null; } // userid -> {fp, nb}
+    /**
+     * @param {function(): object} [getUsers] MeshCentral's in-memory user table. When given, it is the
+     *   one source of credential state for both the request path and the sweep (see observe).
+     */
+    constructor(store, bus, getUsers) { this.store = store; this.bus = bus; this.getUsers = getUsers || null; this.map = new Map(); this.timer = null; } // userid -> {fp, nb}
 
     async load() {
         for (const d of await this.store.userstate.find({})) { this.map.set(d._id, { fp: d.fp, nb: d.nb || 0 }); }
@@ -86,13 +97,18 @@ class NotBefore {
      */
     observe(user) {
         if ((user == null) || (typeof user._id != 'string')) return 0;
+        // One source of truth: MeshCentral authenticates passwords against its in-memory user table and
+        // updates it on every password change it makes, so that copy is used whenever it exists. Reading
+        // the database copy here and the memory copy in the sweep would flip between two states when they
+        // differ (a database write the running server never loaded) and revoke on every flip.
+        if (this.getUsers != null) { const users = this.getUsers(); const mem = users && users[user._id]; if (mem && (mem.type == 'user')) user = mem; }
         const fp = fingerprint(user);
         const cur = parseState(fp);
         let rec = this.map.get(user._id);
         if (rec == null) {
             rec = { fp: fp, nb: 0 };
             this.map.set(user._id, rec);
-            this._save(user._id, rec);
+            if (cur === -1) { this._advance(user._id, rec, fp); } else { this._save(user._id, rec); } // first seen mid-reset: nothing issued earlier stays valid
         } else if (rec.fp != fp) {
             const prev = parseState(rec.fp);
             if (prev === null) {
@@ -104,7 +120,7 @@ class NotBefore {
             } else if (isCredentialChange(prev, cur)) {
                 this._advance(user._id, rec, fp);
             } else {
-                rec.fp = fp; // e.g. a reset flag cleared without a new password: no change of credential
+                rec.fp = fp; // a reset flag cleared without a new password: no change of credential
                 this._save(user._id, rec);
             }
         }
@@ -117,6 +133,7 @@ class NotBefore {
 
     start(getUsers) {
         if (this.timer != null) return;
+        if (this.getUsers == null) this.getUsers = getUsers;
         this.sweep(getUsers());
         this.timer = setInterval(() => { this.sweep(getUsers()); }, SWEEP_MS);
         if (this.timer.unref) this.timer.unref();
