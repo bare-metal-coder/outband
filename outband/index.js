@@ -139,13 +139,14 @@ function create(webserver, parent, hooks, options) {
                 }
             }
         }
+        core.setResources(Object.assign(createStubResources(), require('./devices')(core)));
         core.state = 'ready';
     })().catch(function (err) {
         core.state = 'failed';
         console.log('Outband API failed to start: ' + (err && err.message));
     });
 
-    core.close = function () { if (core.settings) core.settings.stop(); if (core.notBefore) core.notBefore.stop(); if (core.store) core.store.close(); for (const t of core.timers) clearInterval(t); core.timers = []; };
+    core.close = function () { core.bus.emit('shutdown'); if (core.settings) core.settings.stop(); if (core.notBefore) core.notBefore.stop(); if (core.store) core.store.close(); for (const t of core.timers) clearInterval(t); core.timers = []; };
     return core;
 }
 

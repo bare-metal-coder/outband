@@ -178,3 +178,20 @@ Use `test/outband/harness.js` (in-process server with a fake MeshCentral)
 and `test/outband/contract.js` (`check(method, path, response)` validates
 status, headers and body against the spec). Every new endpoint needs
 contract tests and tests for its refusals.
+
+## Reference implementation (groups, devices, events, stream)
+
+* `outband/mappers.js`: every Device, DeviceDetail, Group and Event payload.
+* `outband/devices.js`: `createResources(core)`; wired in `outband/index.js`
+  with the power and console methods left as `not_implemented` stubs.
+* `outband/events.js`: one event visibility rule (`eventVisible`) shared by
+  `/events`, `/devices/{id}/events` and `/stream`.
+* `outband/hub.js` and `outband/stream.js`: the live feed (MeshCentral state
+  changes and Outband audit records, kept 5 minutes) and the SSE endpoint.
+* A device's `capabilities` come from `outband/power.js` and the mappers
+  (`mapCapabilities`); nothing is dispatched when a device is read.
+
+For the power lane: `nodeInfo` in `outband/devices.js` builds the per-device
+facts (connectivity, group kind, rights, Wake-on-LAN peers) that the
+`power.plan` environment needs; `core.audit.write` feeds the stream, so a
+power audit record appears as an `event.created` message without extra code.

@@ -39,13 +39,24 @@ async function start(o) {
     const meshes = {};
     const badLogins = { blocked: false };
     const events = [];
+    const mcEvents = [];
+    const eventTargets = [];
     const webserver = {
         users: users, meshes: meshes, userGroups: {}, destroyedSessions: {},
         args: Object.assign({ port: 443, trustedproxy: ['127.0.0.1'] }, o.args || {}),
         certificates: { CommonName: (o.cn != null) ? o.cn : NAME },
         db: {
             Get: function (id, cb) { const d = dbDocs[id]; setImmediate(function () { cb(null, d ? [JSON.parse(JSON.stringify(d))] : []); }); },
-            SetUser: function (u) { dbDocs[u._id] = JSON.parse(JSON.stringify(u)); }
+            SetUser: function (u) { dbDocs[u._id] = JSON.parse(JSON.stringify(u)); },
+            GetAllTypeNoTypeFieldMeshFiltered: function (meshIds, extra, domainId, type, id, offset, limit, filter, cb) {
+                const out = Object.values(dbDocs).filter(function (d) { return (d.type == type) && (d.domain == domainId) && (meshIds.indexOf(d.meshid) >= 0); });
+                setImmediate(function () { cb(null, JSON.parse(JSON.stringify(out))); });
+            },
+            GetEventsWithLimit: function (ids, domainId, limit, filter, cb) {
+                const out = mcEvents.filter(function (e) { return (e.domain == domainId) && ((ids.indexOf('*') >= 0) || (e.ids || []).some(function (i) { return ids.indexOf(i) >= 0; })); })
+                    .sort(function (a, b) { return new Date(b.time) - new Date(a.time); }).slice(0, limit);
+                setImmediate(function () { cb(null, JSON.parse(JSON.stringify(out))); });
+            }
         },
         authenticate: function (name, pass, d, fn) {
             const id = 'user//' + name.toLowerCase();
@@ -72,6 +83,8 @@ async function start(o) {
         debugSources: '*',
         debug: function (source, ...args) { debugLines.push([source].concat(args).map(function (a) { return (typeof a == 'string') ? a : JSON.stringify(a); }).join(' ')); },
         DispatchEvent: function (ids, src, ev) { events.push(ev); },
+        AddEventDispatch: function (ids, target) { eventTargets.push(target); },
+        connectivityByNode: {},
         authLog: function (...a) { debugLines.push('AUTHLOG ' + a.map(function (x) { return (typeof x == 'string') ? x : JSON.stringify(x); }).join(' ')); },
         addServerWarning: function () { }
     };
@@ -105,7 +118,9 @@ async function start(o) {
     const port = server.address().port;
 
     return {
-        core, webserver, parent, users, dbDocs, meshes, badLogins, events, debugLines, domain, port,
+        core, webserver, parent, users, dbDocs, meshes, badLogins, events, mcEvents, debugLines, domain, port,
+        /** Deliver an event to the handlers registered with AddEventDispatch (as MeshCentral's DispatchEvent does). */
+        dispatch: function (ev) { for (const t of eventTargets.slice()) { if (t.HandleEvent) t.HandleEvent(null, ev, ['*'], '*'); } },
         client: function (defaults) { return new Client(port, defaults); },
         close: function () { core.close(); return new Promise(function (r) { server.close(r); }); }
     };

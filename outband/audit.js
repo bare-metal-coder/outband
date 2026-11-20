@@ -62,6 +62,7 @@ class Audit {
             reason: e.reason || null, params: params, count: 1
         };
         try { await this.store.audit.insert(doc); } catch (ex) { }
+        if (typeof this.onWrite == 'function') { try { this.onWrite(doc); } catch (ex) { } } // live stream feed
         return doc;
     }
 
