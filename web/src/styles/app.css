@@ -1211,3 +1211,8 @@ legend {
 .choice-label .state {
   margin-left: 8px;
 }
+
+.palette-item[aria-disabled='true'] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

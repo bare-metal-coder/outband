@@ -40,12 +40,14 @@ export function powerErrorMessage(err: unknown): string {
   }
 }
 
-/** Start an action. It waits for confirm() when destructive or when there is a path to choose. */
+/**
+ * Start an action. Every power action, however mild, waits for confirm():
+ * a stray key in the palette must never power a machine on or off.
+ */
 export function requestPower(device: Device, action: PowerAction): void {
-  if (action.destructive || action.options.length > 1) {
-    setChoice(0);
-    setPending({ device, action });
-  } else void run(device, action, action.options[0]!);
+  if (busy() !== null) return;
+  setChoice(0);
+  setPending({ device, action });
 }
 
 export function cancelConfirm(): void {

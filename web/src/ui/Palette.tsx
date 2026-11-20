@@ -2,7 +2,7 @@ import { createMemo, createSignal, For, Show, type JSX } from 'solid-js';
 import { availableActions, channelName, matches, type Device, type PowerAction } from '../model/device';
 import { navigate } from '../router';
 import { devices, groupName } from '../state/devices';
-import { requestPower } from '../state/power';
+import { busy, requestPower } from '../state/power';
 import { ChannelLights } from './Lights';
 import { Layer } from './Layer';
 
@@ -52,6 +52,7 @@ export function Palette(): JSX.Element {
 
   const run = (it: Item | undefined) => {
     if (!it) return;
+    if (it.kind === 'action' && busy() !== null) return; // an action is already in flight
     close();
     if (it.kind === 'device') navigate(`/devices/${encodeURIComponent(it.id)}`);
     else requestPower(it.device, it.action);
@@ -102,6 +103,7 @@ export function Palette(): JSX.Element {
                     role="option"
                     class="palette-item"
                     aria-selected={sel() === i()}
+                    aria-disabled={it.kind === 'action' && busy() !== null ? 'true' : undefined}
                     onMouseMove={() => setSel(i())}
                     onClick={() => run(it)}
                   >

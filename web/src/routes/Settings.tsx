@@ -1,6 +1,6 @@
 /** Settings. One section for now: "API tokens" (list, create, revoke). */
 import { createMemo, createResource, createSignal, For, Show, type JSX } from 'solid-js';
-import { login, verify2fa } from '../api/auth';
+import { reauth } from '../api/auth';
 import { ApiError } from '../api/http';
 import { createToken, listTokens, revokeToken, type CreatedToken } from '../api/v1';
 import { relativeTime } from '../model/device';
@@ -8,7 +8,6 @@ import {
   createBody, formScopes, maxDays, needsStepUp, SCOPES, tokenStatus, validateTokenForm, type ApiToken, type Scope, type TokenForm,
 } from '../model/token';
 import { groups } from '../state/devices';
-import { session } from '../state/session';
 import { toast } from '../state/toasts';
 import { Empty } from '../ui/Empty';
 import { Layer } from '../ui/Layer';
@@ -76,7 +75,7 @@ function StepUpDialog(props: { onDone: () => void; onCancel: () => void }): JSX.
     setBusy(true);
     setError(null);
     try {
-      const r = step() === 'password' ? await login(session()?.user?.name ?? '', value()) : await verify2fa(value().replace(/\s+/g, ''));
+      const r = await reauth(step() === 'password' ? { password: value() } : { code: value().replace(/\s+/g, '') });
       if (r.kind === 'ok') props.onDone();
       else if (r.kind === 'needs2fa') {
         setStep('code');

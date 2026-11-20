@@ -27,7 +27,10 @@ export function ConfirmPower(): JSX.Element {
                   <>
                     <p class="muted">{opt().detail}</p>
                     <p class="muted" style={{ 'margin-top': '10px' }}>
-                      Path: <span class="state">{channelName(opt().via)}</span>
+                      Path:{' '}
+                      <Show when={p().action.explicitVia} fallback={<span data-testid="path-default">server default (usually <span class="state">{channelName(opt().via)}</span>)</span>}>
+                        <span class="state">{channelName(opt().via)}</span>
+                      </Show>
                     </p>
                   </>
                 }
@@ -55,7 +58,7 @@ export function ConfirmPower(): JSX.Element {
                 <button ref={cancelBtn} class="btn" onClick={cancelConfirm}>
                   Cancel
                 </button>
-                <button class="btn btn-danger" onClick={() => void confirmPending()} data-testid="confirm-power">
+                <button class={p().action.destructive ? 'btn btn-danger' : 'btn btn-primary'} onClick={() => void confirmPending()} data-testid="confirm-power">
                   {opt().label}
                 </button>
               </div>

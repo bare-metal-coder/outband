@@ -124,8 +124,23 @@ describe('mock: tokens and step-up', () => {
     expect(stale.status).toBe(401);
     expect(stale.json.error.code).toBe('reauth_required');
     expect((await create(c, { name: 'a', scopes: ['audit'] })).json.error.code).toBe('reauth_required');
-    const again = await signIn('ops'); // password then second factor
-    expect((await create(again, { name: 'p2', profile: 'device_power' })).status).toBe(201);
+    // Step-up on the same session: password (202: code needed), wrong code, right code (204). No new cookie.
+    expect((await call('POST', '/api/v1/auth/reauth', { cookie: c, body: { password: 'nope' } })).json.error.code).toBe('invalid_credentials');
+    const pw = await call('POST', '/api/v1/auth/reauth', { cookie: c, body: { password: 'outband' } });
+    expect(pw.status).toBe(202);
+    expect(pw.json.twofa.required).toBe(true);
+    expect(pw.cookie).toBeUndefined();
+    expect((await create(c, { name: 'p2', profile: 'device_power' })).json.error.code).toBe('reauth_required'); // not done yet
+    expect((await call('POST', '/api/v1/auth/reauth', { cookie: c, body: { code: '000000' } })).json.error.code).toBe('invalid_code');
+    expect((await call('POST', '/api/v1/auth/reauth', { cookie: c, body: { code: '123456' } })).status).toBe(204);
+    expect((await create(c, { name: 'p2', profile: 'device_power' })).status).toBe(201);
+  });
+  it('reauth needs a session, and works without a second factor for users who have none', async () => {
+    expect((await call('POST', '/api/v1/auth/reauth', { body: { password: 'outband' } })).status).toBe(401);
+    const c = await signIn('admin');
+    await hook('age-session');
+    expect((await call('POST', '/api/v1/auth/reauth', { cookie: c, body: { password: 'outband' } })).status).toBe(204);
+    expect((await create(c, { name: 'p', profile: 'device_power' })).status).toBe(201);
   });
   it('shows the secret once; lists without it; revoke keeps the row', async () => {
     const c = await signIn();

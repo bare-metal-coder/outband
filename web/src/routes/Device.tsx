@@ -191,7 +191,7 @@ export default function Device(props: { id: string; tab?: string }): JSX.Element
           <div class="actions-row" data-testid="power-actions">
             <For each={availableActions(dev())} fallback={<span class="muted">No power actions are available for this device right now.</span>}>
               {(a) => (
-                <button class={a.destructive ? 'btn btn-danger' : 'btn'} disabled={busy() === dev().id} data-action={a.kind} onClick={() => requestPower(dev(), a)}>
+                <button class={a.destructive ? 'btn btn-danger' : 'btn'} disabled={busy() !== null} data-action={a.kind} onClick={() => requestPower(dev(), a)}>
                   <Icon name={a.kind === 'reset' || a.kind === 'cycle' ? 'restart' : 'power'} />
                   {a.label}
                   <Show when={a.options.length > 1}>

@@ -27,7 +27,7 @@ document.addEventListener('click', (ev) => {
   const a = (ev.target as Element | null)?.closest?.('a');
   if (!a || a.target || a.hasAttribute('download') || a.dataset.external !== undefined) return;
   const href = a.getAttribute('href');
-  if (!href || !href.startsWith('/')) return;
+  if (!href || !href.startsWith('/') || href.startsWith('//')) return; // `//host` is another origin
   ev.preventDefault();
   navigate(href);
 });

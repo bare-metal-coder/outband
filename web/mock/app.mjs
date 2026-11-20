@@ -184,6 +184,28 @@ export function createMock(opts = {}) {
     if (!s?.user) return err(res, 401, 'unauthenticated', 'Sign in first', undefined, { 'WWW-Authenticate': 'Bearer realm="outband"' });
     const caller = users[s.user.name];
 
+    if (p === '/api/v1/auth/reauth' && m === 'POST') {
+      // Step-up on the existing session: {password}, then {code} when the user has a second factor. No new session.
+      const b = await readBody(req);
+      if (b === null || Object.keys(b).length !== 1 || !('password' in b || 'code' in b)) return err(res, 400, 'invalid_request', 'Send {password} or {code}');
+      if ('password' in b) {
+        if (b.password !== caller.password) return err(res, 401, 'invalid_credentials', 'Invalid password');
+        s.lastAuth = Date.now();
+        if (caller.twofa) {
+          s.reauthPw = true;
+          return json(res, 202, { twofa: { required: true, methods: ['otp', 'email'] } });
+        }
+        res.writeHead(204);
+        return res.end();
+      }
+      if (!s.reauthPw) return err(res, 401, 'no_pending_login', 'Enter your password first');
+      if (b.code !== OTP) return err(res, 401, 'invalid_code', 'Invalid code');
+      s.reauthPw = false;
+      s.lastAuth2fa = Date.now();
+      res.writeHead(204);
+      return res.end();
+    }
+
     if (p === '/api/v1/server') {
       return json(res, 200, { name: 'Outband (mock)', version: '1.3.1', outband_version: '0.1.0', api_version: API_VERSION, features: { amt: true, twofa: { available: true, ip_exemptions: false, methods: ['otp', 'email'] }, api_tokens: true, console_kinds: ['sol'], legacy_ui: true } });
     }

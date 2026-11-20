@@ -187,12 +187,40 @@ try {
       await shot('10-palette');
       await page.keyboard.press('Escape');
     });
+    await step('palette: even a mild action ("on") asks for confirmation and sends nothing until confirmed', async () => {
+      const powerPosts = [];
+      const onReq = (r) => r.url().endsWith('/power') && r.method() === 'POST' && powerPosts.push(r.url());
+      page.on('request', onReq);
+      await page.keyboard.press('Control+k');
+      await page.waitForSelector('[data-testid=palette]');
+      await page.keyboard.type('web01 on');
+      await page.waitForSelector('.palette-item:has-text("Power on")');
+      await page.keyboard.press('Enter');
+      await page.waitForSelector('[data-testid=confirm-dialog]');
+      expect(await page.locator('[data-testid=confirm-dialog]').innerText().then((t) => t.includes('Power on')), 'dialog names the action');
+      await page.waitForTimeout(400);
+      expect(powerPosts.length === 0, 'nothing sent before confirm');
+      await shot('10b-palette-confirm');
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(300);
+      expect(powerPosts.length === 0, 'cancel sends nothing');
+      await page.keyboard.press('Control+k');
+      await page.keyboard.type('web01 on');
+      await page.keyboard.press('Enter');
+      await page.waitForSelector('[data-testid=confirm-dialog]');
+      await page.click('[data-testid=confirm-power]');
+      await page.waitForSelector('.toast:has-text("Power on")');
+      expect(powerPosts.length === 1, 'exactly one request after confirm');
+      page.off('request', onReq);
+    });
     await step('API tokens: step-up, show once, copy, revoke', async () => {
       // Error toasts stay until dismissed (design rule); clear them so they do not cover the dialogs below.
       for (let n = await page.locator('.toast button[aria-label=Dismiss]').count(); n > 0; n--) await page.locator('.toast button[aria-label=Dismiss]').first().click();
       await page.click('[data-testid=user-menu]');
       await page.click('[data-testid=settings-link]');
       await page.waitForSelector('text=No API tokens');
+      const authCalls = [];
+      page.on('request', (r) => /\/auth\/(login|reauth)$/.test(r.url()) && authCalls.push(r.url().split('/').pop()));
       await hook('age-session'); // the sign-in is now older than 15 minutes
       await page.click('[data-testid=new-token]');
       await page.fill('#tname', 'e2e-automation');
@@ -212,16 +240,26 @@ try {
       await page.waitForSelector('[data-testid=copy-secret]:has-text("Copied")');
       expect((await page.evaluate(() => navigator.clipboard.readText())) === secret, 'clipboard holds the secret');
       await shot('13-secret');
-      await page.click('[data-testid=secret-done]');
+      expect(authCalls.join() === 'reauth,reauth', 'step-up uses /auth/reauth twice and never /auth/login: ' + authCalls);
+      await page.keyboard.press('Escape');
+      await page.waitForSelector('[data-testid=secret-dialog]', { state: 'detached' });
       await page.waitForSelector('[data-testid=token-row]:has-text("e2e-automation")');
       expect(!(await page.content()).includes(secret), 'secret is gone after closing');
       await noOverflow('tokens');
       await shot('14-tokens');
-      await page.click('[data-testid=revoke]');
+      await page.locator('[data-testid=revoke]').first().click();
       await page.waitForSelector('[data-testid=revoke-dialog]');
       await page.click('[data-testid=confirm-revoke]');
       await page.waitForSelector('[data-testid=token-row][data-status=revoked]');
       await shot('15-revoked');
+    });
+    await step('secret dialog also closes on a backdrop click', async () => {
+      await page.click('[data-testid=new-token]');
+      await page.fill('#tname', 'second');
+      await page.click('[data-testid=create-submit]');
+      await page.waitForSelector('[data-testid=secret-dialog]');
+      await page.mouse.click(5, 5);
+      await page.waitForSelector('[data-testid=secret-dialog]', { state: 'detached' });
     });
     await step('404 page', async () => {
       await page.goto(BASE + '/nope', { waitUntil: 'load' });
