@@ -95,7 +95,7 @@ function mapDevice(ctx, node, info) {
     const d = {
         id: lastSegment(node._id),
         name: str(node.name, 256) || '',
-        host: str(node.host, 256),
+        host: ((typeof node.host == 'string') && net.isIP(node.host.replace(/^\[(.*)\]$/, '$1')) && !ctx.seesDeviceAddresses()) ? null : str(node.host, 256),
         group: { id: str(info.group && info.group.id, 128), name: str(info.group && info.group.name, 256) || '' },
         os: str(node.osdesc, 256),
         online: (conn & CONN.AGENT) != 0,
@@ -137,13 +137,13 @@ function mapDeviceDetail(ctx, node, info) {
     if (info.serial != null) hw.serial = str(info.serial, 128);
     const out = { manufacturer: hw.manufacturer, model: hw.model, cpu: hw.cpu, memory_mb: hw.memory_mb };
     if (ctx.seesDeviceAddresses()) out.serial = hw.serial;
-    const hasHw = (hw.manufacturer != null) || (hw.model != null) || (hw.cpu != null) || (hw.memory_mb != null) || (hw.serial != null);
+    const hasHw = (hw.manufacturer != null) || (hw.model != null) || (hw.cpu != null) || (hw.memory_mb != null) || (ctx.seesDeviceAddresses() && (hw.serial != null));
     const agent = (node.agent != null) && (typeof node.agent == 'object');
     return Object.assign(d, {
         rights: mapRights(info.rights),
         description: str(node.desc, 1024),
         tags: Array.isArray(node.tags) ? node.tags.filter(function (t) { return typeof t == 'string'; }).map(function (t) { return t.substring(0, 64); }).slice(0, 64) : [],
-        agent: agent ? { version: (node.agent.ver != null) ? String(node.agent.ver).substring(0, 32) : null, type: Number.isInteger(node.agent.id) ? node.agent.id : null, connected_at: ((d.online) ? iso(info.lastSeen) : null) } : null,
+        agent: agent ? { version: (node.agent.ver != null) ? String(node.agent.ver).substring(0, 32) : null, type: Number.isInteger(node.agent.id) ? node.agent.id : null, connected_at: (d.online ? iso(info.agentConnectedAt) : null) } : null,
         hardware: hasHw ? out : null
     });
 }
@@ -158,6 +158,12 @@ const MC_TEMPLATES = {
 };
 const GENERIC = { node: 'Device event', mesh: 'Device group event', user: 'User event', ugrp: 'User group event', server: 'Server event' };
 
+/** Stable id of an event; a stored MeshCentral event without an id gets one derived from its content. */
+function eventId(ev) {
+    if (ev._id != null) return String(ev._id);
+    return 'mc_' + require('crypto').createHash('sha1').update(JSON.stringify([ev.time, ev.action, ev.nodeid, ev.meshid, ev.userid, ev.etype])).digest('hex').substring(0, 20);
+}
+
 function isAuditRecord(ev) { return (ev.etype === undefined) && (typeof ev.action == 'string') && ev.action.startsWith('outband.'); }
 
 /** @returns {object} spec Event, from a MeshCentral event or an Outband audit record */
@@ -168,7 +174,7 @@ function mapEvent(ctx, ev) {
     const userid = audit ? ev.user : ev.userid;
     const tokenId = audit ? ev.token_id : null;
     const out = {
-        id: String(ev._id),
+        id: eventId(ev),
         time: iso(ev.time) || new Date(0).toISOString(),
         type: str(audit ? ev.type : ev.etype, 32) || 'server',
         action: str(ev.action, 64) || 'event'
@@ -197,6 +203,6 @@ function mapEvent(ctx, ev) {
 }
 
 module.exports = {
-    mapDevice, mapDeviceDetail, mapEvent, mapGroup, mapRights, mapCapabilities, hardwareOf, groupKind, isAuditRecord,
+    mapDevice, mapDeviceDetail, mapEvent, mapGroup, mapRights, mapCapabilities, hardwareOf, groupKind, isAuditRecord, eventId,
     CONN, LIMITEVENTS, POWER_STATES
 };

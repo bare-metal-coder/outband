@@ -29,7 +29,7 @@ const USERS = {
 };
 
 async function world(extra) {
-    const h = await start(Object.assign({ users: USERS }, extra || {}));
+    const h = await start(Object.assign({ users: USERS, settings: { outbandapi: { ratelimits: { eventsperminute: 100000 } } } }, extra || {}));
     h.meshes[MA] = { _id: MA, name: 'Alpha', desc: 'First group', mtype: 2, domain: '' };
     h.meshes[MB] = { _id: MB, name: 'Beta', desc: '', mtype: 1, domain: '' };
     const node = function (id, name, mesh, more) { h.dbDocs[id] = Object.assign({ _id: id, type: 'node', name: name, host: name + '.example.com', meshid: mesh, domain: '' }, more || {}); };
@@ -398,8 +398,8 @@ test('stream: group restriction, rights and identities apply to every message', 
         await h.core.audit.write({ domain: '', type: 'node', action: 'outband.power', user: 'user//alice', userName: 'alice', tokenId: 'tok_EXAMPLEid02', tokenName: 'private-token-label', deviceId: FN3, groupId: MB, ip: '198.51.100.5', params: { power_action: 'off', path: 'amt' } });
         await h.core.audit.write({ domain: '', type: 'node', action: 'outband.power', user: 'user//alice', userName: 'alice', tokenId: 'tok_EXAMPLEid02', tokenName: 'private-token-label', deviceId: FN1, groupId: MA, ip: '198.51.100.5', params: { power_action: 'on', path: 'amt' } });
         await sAdmin.waitFor(function (x) { return x.of('event.created').length >= 4; });
-        await sA.waitFor(function (x) { return x.of('event.created').length >= 2; });
-        await tick();
+        await sA.waitFor(function (x) { return x.of('event.created').length >= 2 && x.of('device.updated').length >= 1; });
+        await new Promise(function (r) { setTimeout(r, 400); });
         // the group-restricted admin token: group A only, no domain-wide events, no identities, no source_ip
         assert.strictEqual(sA.of('device.updated').length, 1); assert.strictEqual(sA.of('device.updated')[0].data.id, N1);
         assert.deepStrictEqual(sA.of('event.created').map(function (m) { return m.data.action; }).sort(), ['changenode', 'outband.power']);
@@ -427,8 +427,8 @@ test('stream: resume with Last-Event-ID uses current visibility; unknown ids get
         h.dispatch({ action: 'changenode', etype: 'node', meshid: MA, nodeid: FN2, userid: 'user//alice', username: 'alice', domain: '' });
         // header and query parameter both work; the header wins
         const r = await open(h, { client: alice, headers: { 'last-event-id': last }, query: '?last_event_id=1' });
-        await r.waitFor(function (x) { return x.of('event.created').length >= 2; });
-        await tick();
+        await r.waitFor(function (x) { return x.of('event.created').length >= 2 && x.of('device.updated').length >= 1; });
+        await new Promise(function (r2) { setTimeout(r2, 400); });
         assert.strictEqual(r.of('resync').length, 0);
         assert.strictEqual(r.of('device.power').length, 1);
         assert.ok(r.of('device.updated').length >= 1);
@@ -442,7 +442,7 @@ test('stream: resume with Last-Event-ID uses current visibility; unknown ids get
         const bob = await session(h, 'bob');
         const rb = await open(h, { client: bob, headers: { 'last-event-id': last } });
         await rb.waitFor(function (x) { return x.of('event.created').length >= 1; });
-        await tick();
+        await new Promise(function (r2) { setTimeout(r2, 400); });
         assert.deepStrictEqual(rb.of('event.created').map(function (m) { return m.data.group_id; }).filter(Boolean), [B]);
         assert.ok(rb.of('device.updated').every(function (m) { return m.data.id == N3; }));
         rb.close();
@@ -457,7 +457,7 @@ test('stream: resume with Last-Event-ID uses current visibility; unknown ids get
         const tA = await token(h, 'gina', { scopes: ['read'], groups: [A] });
         const rt = await open(h, { bearer: tA, headers: { 'last-event-id': last } });
         await rt.waitFor(function (x) { return x.of('event.created').length >= 1; });
-        await tick();
+        await new Promise(function (r2) { setTimeout(r2, 400); });
         assert.ok(rt.of('event.created').every(function (m) { return (m.data.group_id == A) || (m.data.group_id == null); }));
         assert.ok(rt.of('device.updated').every(function (m) { return m.data.id != N3; }));
         rt.close();
@@ -554,4 +554,177 @@ test('stream: errors answer JSON, not a stream', async function () {
         const long = await openStream(h, { client: c, headers: { 'last-event-id': 'x'.repeat(100) } });
         assert.strictEqual(long.status, 400);
     });
+});
+
+// ---- event reads: bounded work, continuation cursor, limiter -----------------
+
+function countReads(h) {
+    const c = { calls: 0, rows: 0, limits: [] };
+    const orig = h.webserver.db.GetEventsWithLimit;
+    h.webserver.db.GetEventsWithLimit = function (ids, domain, limit, filter, cb) { c.calls++; c.limits.push(limit); return orig(ids, domain, limit, filter, function (e, docs) { c.rows += docs.length; cb(e, docs); }); };
+    return c;
+}
+function manyEvents(h, n, every) {
+    for (let i = 0; i < n; i++) mcEvent(h, { etype: (i % every == 0) ? 'mesh' : 'node', action: 'changenode', meshid: MA, nodeid: FN1, ids: [FN1, MA, '*'], time: new Date(Date.parse('2026-01-01T00:00:00Z') + i * 1000).toISOString(), _id: 'EV' + String(i).padStart(5, '0') });
+}
+
+test('events: a filter that matches nothing costs one bounded read per request, and the cursor continues', async function () {
+    await withWorld(async function (h) {
+        manyEvents(h, 600, 100);
+        const reads = countReads(h);
+        const alice = await session(h, 'alice');
+        // no match at all: every page is one read of at most 5000 rows, and paging ends with a null cursor only when nothing is left
+        let r = await call(alice, 'GET', '/api/v1/events?type=zzz&limit=10&audit=false');
+        assert.strictEqual(r.status, 200); assert.strictEqual(reads.calls, 1);
+        assert.ok(reads.limits.every(function (l) { return l <= 5000; }));
+        assert.deepStrictEqual(r.body.items, []);
+        assert.ok(r.body.next_cursor, 'a short page still carries a continuation');
+        let pages = 1, cur = r.body.next_cursor;
+        while (cur && pages < 50) { r = await call(alice, 'GET', '/api/v1/events?type=zzz&limit=10&audit=false&cursor=' + cur); assert.deepStrictEqual(r.body.items, []); cur = r.body.next_cursor; pages++; }
+        assert.strictEqual(cur, null); assert.ok(pages >= 5 && pages < 50, 'pages: ' + pages);
+        assert.strictEqual(reads.calls, pages, 'one read per request');
+        assert.ok(Math.max.apply(null, reads.limits) <= 5000);
+        // until in the distant past: bounded, empty, no hidden older events
+        reads.calls = 0;
+        r = await call(alice, 'GET', '/api/v1/events?until=2000-01-01T00:00:00Z&audit=false&limit=10');
+        assert.strictEqual(reads.calls, 1); assert.deepStrictEqual(r.body.items, []);
+        // sparse matches are all found by following the continuation
+        const found = []; cur = null; pages = 0;
+        do {
+            r = await call(alice, 'GET', '/api/v1/events?type=mesh&limit=2&audit=false' + (cur ? '&cursor=' + cur : ''));
+            for (const e of r.body.items) found.push(e.id);
+            cur = r.body.next_cursor; pages++;
+        } while (cur && pages < 60);
+        assert.strictEqual(found.length, 6, found.join()); assert.strictEqual(new Set(found).size, 6);
+        // a malformed depth in the cursor is refused
+        const bad = Buffer.from(JSON.stringify({ t: 1, i: 'x', d: 999999 })).toString('base64url');
+        assert.strictEqual((await call(alice, 'GET', '/api/v1/events?cursor=' + bad)).status, 400);
+    });
+});
+
+test('events: pages through older events with the scan cursor, newest first, nothing twice', async function () {
+    await withWorld(async function (h) {
+        manyEvents(h, 450, 1000);
+        const alice = await session(h, 'alice');
+        const seen = []; let cur = null, pages = 0;
+        do {
+            const r = await call(alice, 'GET', '/api/v1/events?audit=false&limit=40' + (cur ? '&cursor=' + cur : ''));
+            for (const e of r.body.items) seen.push(e.id);
+            cur = r.body.next_cursor; pages++;
+        } while (cur && pages < 40);
+        assert.strictEqual(seen.length, 450); assert.strictEqual(new Set(seen).size, 450);
+        assert.deepStrictEqual(seen, seen.slice().sort().reverse());
+    });
+});
+
+test('events: /events and /devices/{id}/events share a per-credential limiter (429 with Retry-After)', async function () {
+    await withWorld(async function (h) {
+        const alice = await session(h, 'alice');
+        let last;
+        for (let i = 0; i < 30; i++) { last = await call(alice, 'GET', i % 2 ? '/api/v1/events' : '/api/v1/devices/' + N1 + '/events'); assert.strictEqual(last.status, 200); }
+        last = await call(alice, 'GET', '/api/v1/events');
+        assert.strictEqual(last.status, 429); assert.strictEqual(last.body.error.code, 'rate_limited'); assert.ok(last.headers['retry-after']);
+        assert.strictEqual((await call(alice, 'GET', '/api/v1/devices')).status, 200, 'other endpoints are not affected');
+        assert.strictEqual((await call(await session(h, 'bob'), 'GET', '/api/v1/events')).status, 200, 'per credential');
+    }, { settings: {} });
+});
+
+// ---- privacy details ------------------------------------------------------------
+
+test('devices: a host that is an IP literal follows the address rule; q does not match it', async function () {
+    await withWorld(async function (h) {
+        h.dbDocs[FN3].host = '192.0.2.99';
+        h.dbDocs[FN2].host = '[2001:db8::2]';
+        const ro = await token(h, 'alice', { scopes: ['read'] });
+        const list = await call(h.client(), 'GET', '/api/v1/devices', bearer(ro));
+        assert.strictEqual(list.body.items.find(function (d) { return d.id == N3; }).host, null);
+        assert.strictEqual(list.body.items.find(function (d) { return d.id == N2; }).host, null);
+        assert.strictEqual(list.body.items.find(function (d) { return d.id == N1; }).host, 'server-01.example.com');
+        assert.ok(!list.text.includes('192.0.2.99') && !list.text.includes('2001:db8'));
+        assert.strictEqual((await call(h.client(), 'GET', '/api/v1/devices?q=192.0.2.99', bearer(ro))).body.items.length, 0);
+        assert.strictEqual((await call(h.client(), 'GET', '/api/v1/devices/' + N3, bearer(ro))).body.host, null);
+        const sess = await session(h, 'alice');
+        assert.strictEqual((await call(sess, 'GET', '/api/v1/devices?q=192.0.2.99')).body.items.length, 1);
+        assert.strictEqual((await call(sess, 'GET', '/api/v1/devices/' + N3)).body.host, '192.0.2.99');
+        const con = await token(h, 'alice', { scopes: ['read', 'console'], groups: [B] });
+        assert.strictEqual((await call(h.client(), 'GET', '/api/v1/devices/' + N3, bearer(con))).body.host, '192.0.2.99');
+    });
+});
+
+test('devices: hardware is null when nothing visible remains; agent.connected_at is the real time or null', async function () {
+    await withWorld(async function (h) {
+        h.dbDocs['si' + FN1] = { _id: 'si' + FN1, hardware: { identifiers: { bios_serial: 'SN-EXAMPLE-0001' } } };
+        const ro = await token(h, 'alice', { scopes: ['read'] });
+        let r = await call(h.client(), 'GET', '/api/v1/devices/' + N1, bearer(ro));
+        assert.strictEqual(r.body.hardware, null);
+        assert.strictEqual(r.body.agent.connected_at, null, 'unknown connection time');
+        const sess = await session(h, 'alice');
+        assert.strictEqual((await call(sess, 'GET', '/api/v1/devices/' + N1)).body.hardware.serial, 'SN-EXAMPLE-0001');
+        h.dbDocs['lc' + FN1] = { _id: 'lc' + FN1, type: 'lastconnect', time: Date.parse('2026-01-01T09:00:00Z'), connectType: 1 };
+        r = await call(sess, 'GET', '/api/v1/devices/' + N1);
+        assert.strictEqual(r.body.agent.connected_at, '2026-01-01T09:00:00.000Z');
+    });
+});
+
+// ---- stream hardening -------------------------------------------------------------
+
+test('stream: a server-wide cap sits on top of the per-credential cap, and slots come back', async function () {
+    await withWorld(async function (h) {
+        h.core.limits.streamsTotal.max = 2;
+        const a = await session(h, 'alice'), b = await session(h, 'bob');
+        const s1 = await open(h, { client: a }), s2 = await open(h, { client: b });
+        const s3 = await openStream(h, { client: await session(h, 'eve') });
+        assert.strictEqual(s3.status, 429);
+        await s3.waitFor(function (x) { return x.ended; });
+        check('GET', '/api/v1/stream', { status: s3.status, headers: s3.headers, text: s3.raw, body: s3.body });
+        assert.strictEqual(h.core.limits.streams.map.has('ses:user//eve/' + 'x'), false);
+        s1.close();
+        let s4;
+        for (let i = 0; i < 100; i++) { s4 = await openStream(h, { client: await session(h, 'eve'), ignoreErrors: true }); if (s4.status == 200) break; s4.close(); await tick(); }
+        assert.strictEqual(s4.status, 200);
+        s2.close(); s4.close();
+        for (let i = 0; i < 100 && (h.core.limits.streamsTotal.map.size > 0); i++) await tick();
+        assert.strictEqual(h.core.limits.streamsTotal.map.size, 0);
+        assert.strictEqual(h.core.limits.streams.map.size, 0);
+    });
+});
+
+test('stream: a credential check that never answers ends the stream with closed within 5 seconds', async function () {
+    await withWorld(async function (h) {
+        h.core.streamOptions = { revalidateMs: 300 };
+        const s = await open(h, { client: await session(h, 'alice') });
+        h.core.revalidate = function () { return new Promise(function () { }); };
+        const t0 = Date.now();
+        assert.ok(await s.waitFor(function (x) { return x.of('closed').length > 0 && x.ended; }, 5000), 'closed');
+        assert.ok(Date.now() - t0 < 5000);
+        for (let i = 0; i < 50 && (h.core.limits.streams.map.size > 0); i++) await tick();
+        assert.strictEqual(h.core.limits.streams.map.size, 0);
+    });
+});
+
+test('stream: device.updated is coalesced per device; invisible devices cost no database read', async function () {
+    await withWorld(async function (h) {
+        const s = await open(h, { client: await session(h, 'alice') });
+        const eve = await open(h, { client: await session(h, 'eve') });
+        const gets = [];
+        const orig = h.webserver.db.Get;
+        h.webserver.db.Get = function (id, cb) { gets.push(id); return orig(id, cb); };
+        for (let i = 0; i < 40; i++) h.dispatch({ action: 'nodeconnect', meshid: MA, nodeid: FN1, domain: '', conn: 5, pwr: 1, nolog: 1 });
+        await s.waitFor(function (x) { return x.of('device.updated').length > 0; });
+        await tick(); await tick(); await tick(); await tick(); await tick(); await tick(); await tick(); await tick(); await tick(); await tick();
+        const n = s.of('device.updated').length;
+        assert.ok(n >= 1 && n <= 4, 'coalesced: ' + n);
+        assert.strictEqual(eve.messages.filter(function (m) { return m.type != 'ready'; }).length, 0);
+        assert.ok(gets.filter(function (g) { return g == FN1; }).length <= 2 * n, 'reads are per sent update, not per stream per event: ' + gets.length);
+        s.close(); eve.close();
+    });
+});
+
+test('core.close detaches the hub from MeshCentral and the audit feed', async function () {
+    const h = await world();
+    const removed = [];
+    h.parent.RemoveEventDispatch = function (ids, t) { removed.push(t); };
+    await h.close();
+    assert.strictEqual(removed.length, 1); assert.strictEqual(removed[0], h.core.hub.handler);
+    assert.strictEqual(h.core.audit.onWrite, null);
 });

@@ -4,8 +4,9 @@
  * and stay as the `not_implemented` stubs; devices still report their
  * `capabilities`, computed from outband/power.js without dispatching.
  *
- * Order of checks for every endpoint: visibility (404, identical for
- * "missing" and "not visible"), scope, MeshCentral rights, reachability.
+ * Order of checks for every endpoint: scope (403), then visibility (404,
+ * identical for "missing" and "not visible"), MeshCentral rights,
+ * reachability. Every method here starts with the central scope check.
  * @license Apache-2.0
  */
 
@@ -37,6 +38,9 @@ function checkPageCursor(c) {
     if ((typeof c.n != 'string') || (typeof c.i != 'string') || (c.n.length > 600) || (c.i.length > 200)) throw new ApiError(400, 'invalid_request', 'Invalid cursor', { field: 'cursor' });
     return c;
 }
+
+/** A host name is always visible; an IP literal follows the device-address rule. */
+function hostVisible(ctx, host) { return ctx.seesDeviceAddresses() || (require('net').isIP(String(host || '').replace(/^\[(.*)\]$/, '$1')) == 0); }
 
 function afterCursor(name, id, c) { return (c == null) || (name > c.n) || ((name == c.n) && (id > c.i)); }
 function sortKey(name) { return String(name || '').toLowerCase(); }
@@ -81,7 +85,7 @@ function createResources(core) {
         return {
             group: { id: lastSegment(node.meshid), name: mesh ? mesh.name : '', kind: groupKind(mesh) },
             rights: ctx.meshRights(node.meshid), conn: conn, powerState: s ? (s.powerState | 0) : 0,
-            powerSince: pw ? pw.since : null, lastSeen: lastSeen, ips: ips, wolPeers: peers > 0,
+            powerSince: pw ? pw.since : null, agentConnectedAt: (o.lc && ((conn & CONN.AGENT) != 0) && (o.lc.connectType == 1) && (typeof o.lc.time == 'number')) ? o.lc.time : null, lastSeen: lastSeen, ips: ips, wolPeers: peers > 0,
             sysinfo: o.sysinfo || null
         };
     }
@@ -144,7 +148,7 @@ function createResources(core) {
             let ids = visibleMeshes(ctx).map(function (v) { return v.mesh._id; });
             if (args.group) ids = ids.filter(function (id) { return lastSegment(id) == args.group; });
             let nodes = (await allNodes(core, ctx.domain.id, ids)).filter(function (n) { return (typeof n._id == 'string') && (typeof n.meshid == 'string') && (ctx.meshRights(n.meshid) != 0); });
-            if (args.q) { const q = args.q.toLowerCase(); nodes = nodes.filter(function (n) { return (String(n.name || '').toLowerCase().indexOf(q) >= 0) || (String(n.host || '').toLowerCase().indexOf(q) >= 0); }); }
+            if (args.q) { const q = args.q.toLowerCase(); nodes = nodes.filter(function (n) { return (String(n.name || '').toLowerCase().indexOf(q) >= 0) || (hostVisible(ctx, n.host) && (String(n.host || '').toLowerCase().indexOf(q) >= 0)); }); }
             if (args.status) {
                 nodes = nodes.filter(function (n) {
                     const s = connectivity(n._id), c = s ? (s.connectivity | 0) : 0;
@@ -196,11 +200,11 @@ function createResources(core) {
     }
 
     impl.stream = createStream(core, hub, {
-        nodeMessage: async function (ctx, nodeid, lcOk) {
+        nodeMessage: async function (ctx, nodeid, entry) {
             const node = await dbGet(core, nodeid);
             if ((node == null) || (typeof node.meshid != 'string') || (ctx.meshRights(node.meshid) == 0) || (ws.meshes[node.meshid] == null)) return null;
             const lc = (((connectivity(nodeid) || {}).connectivity & CONN.AGENT) != 0) ? null : await dbGet(core, 'lc' + nodeid);
-            return mapDevice(ctx, node, nodeInfo(ctx, node, { lc: lc, peers: agentPeers() }));
+            return mapDevice(ctx, node, nodeInfo(ctx, node, { lc: lc, peers: entry ? (entry.peers || (entry.peers = agentPeers())) : agentPeers() }));
         }
     });
     return impl;

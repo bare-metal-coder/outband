@@ -137,7 +137,7 @@ their own rules:
 
 | Field | Helper |
 |---|---|
-| `ips`, `hardware.serial` | `ctx.seesDeviceAddresses()` |
+| `ips`, `hardware.serial`, `host` when it is an IP literal | `ctx.seesDeviceAddresses()` |
 | user and token names; otherwise `ctx.pseudonymUser(userid)` / `ctx.pseudonymToken(tokenId)` | `ctx.seesIdentities()` |
 | `source_ip`, and `ip` / `email` message parameters | `ctx.seesSourceIp()` |
 | Outband audit record messages | `Audit.message(doc)` |
@@ -195,3 +195,13 @@ For the power lane: `nodeInfo` in `outband/devices.js` builds the per-device
 facts (connectivity, group kind, rights, Wake-on-LAN peers) that the
 `power.plan` environment needs; `core.audit.write` feeds the stream, so a
 power audit record appears as an `event.created` message without extra code.
+
+Device `name`, `description` and `tags`, and group `name` and `description`,
+are visible to every caller that can see the device or group (scope `read`);
+they are set by the group's administrators and are not treated as private.
+
+Event listings read a bounded amount per request (see `collect` in
+`outband/events.js`): the cursor is a scan position and a page can be short
+while `next_cursor` is set. `/events` and `/devices/{id}/events` have their
+own limiter (30 per minute per credential), and streams have a server-wide
+cap besides the per-credential one.

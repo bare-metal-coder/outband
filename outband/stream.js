@@ -25,6 +25,9 @@ const REASONS = ['revoked', 'expired', 'logout', 'locked', 'rights', 'disabled',
 const PING_MS = 25000;
 const REVALIDATE_MS = 2500;
 const MAX_BACKLOG = 1 << 20;
+const MAX_QUEUE = 500;      // hub entries waiting for one stream; beyond this the stream asks the client to resync
+const COALESCE_MS = 200;    // device.updated for one device is sent at most this often
+const CHECK_TIMEOUT_MS = 4000;
 const SLOTS = 4; // message ids are seq * SLOTS + slot
 
 function iso(t) { return new Date(t).toISOString(); }
@@ -53,13 +56,12 @@ function createStream(core, hub, deps) {
                 if (ev.action == 'removenode') {
                     if ((typeof meshid == 'string') && (ctx.meshRights(meshid) != 0)) out.push({ slot: 1, type: 'device.removed', data: { id: id } });
                 } else if ((ev.action == 'nodeconnect') || (ev.action == 'addnode') || (ev.action == 'changenode')) {
+                    // The group is checked before anything is read; a device in a group the caller cannot see produces nothing.
                     const visibleBefore = (typeof meshid == 'string') && (ctx.meshRights(meshid) != 0);
                     if (visibleBefore && entry.powerChanged && (typeof ev.pwr == 'number')) {
                         out.push({ slot: 0, type: 'device.power', data: { id: id, power: { state: POWER_STATES[ev.pwr] || 'unknown', since: iso(entry.t) } } });
                     }
-                    const dev = await deps.nodeMessage(ctx, nodeid);
-                    if (dev) out.push({ slot: 1, type: 'device.updated', data: dev });
-                    else if (visibleBefore) out.push({ slot: 1, type: 'device.removed', data: { id: id } });
+                    if (visibleBefore) out.push({ slot: 1, type: 'device.updated', nodeid: nodeid, id: id });
                 }
             }
             if (!ev.nolog && (typeof ev.etype == 'string') && eventVisible(ctx, ev)) {
@@ -94,23 +96,49 @@ function createStream(core, hub, deps) {
             if (closed) return;
             if (reason) send('closed', { reason: reason });
             closed = true;
-            clearInterval(pingTimer); clearInterval(checkTimer);
+            clearInterval(pingTimer); clearInterval(checkTimer); clearTimeout(flushTimer);
             for (const l of listeners) bus.removeListener(l[0], l[1]);
             hub.removeListener('entry', onEntry);
             try { res.end(); } catch (ex) { }
             resolveDone();
         }
 
+        // device.updated is coalesced per device: the latest state is sent once per interval.
+        const pendingUpdates = new Map();
+        let flushTimer = null;
+        const flushUpdates = function () {
+            flushTimer = null;
+            const batch = Array.from(pendingUpdates.values());
+            pendingUpdates.clear();
+            chain = chain.then(async function () {
+                for (const u of batch) {
+                    if (closed) return;
+                    const dev = await deps.nodeMessage(ctx, u.nodeid, u.entry);
+                    if (closed) return;
+                    if (dev) send('device.updated', dev, u.id); else send('device.removed', { id: u.deviceId }, u.id);
+                }
+            }).catch(function () { });
+        };
+        let queued = 0, overflow = false;
         const deliver = function (entry, afterId) {
+            if (queued >= MAX_QUEUE) { overflow = true; return; }
+            queued++;
             chain = chain.then(async function () {
                 if (closed) return;
                 const msgs = await messagesFor(ctx, entry);
                 for (const m of msgs) {
                     const id = entry.seq * SLOTS + m.slot;
                     if ((afterId != null) && (id <= afterId)) continue;
-                    if (wants(m.type)) send(m.type, m.data, id);
+                    if (!wants(m.type)) continue;
+                    if (m.type == 'device.updated') {
+                        pendingUpdates.set(m.nodeid, { nodeid: m.nodeid, deviceId: m.id, id: id, entry: entry });
+                        if (flushTimer == null) flushTimer = setTimeout(flushUpdates, COALESCE_MS);
+                    } else send(m.type, m.data, id);
                 }
-            }).catch(function () { });
+            }).catch(function () { }).then(function () {
+                queued--;
+                if (overflow && (queued == 0) && !closed) { overflow = false; send('resync', {}); }
+            });
         };
         const onEntry = function (entry) { deliver(entry, null); };
 
@@ -132,15 +160,15 @@ function createStream(core, hub, deps) {
         let fp = fingerprint(ctx), checking = false;
         const check = async function () {
             if (closed || checking) return;
-            checking = true;
+            checking = true; let timer = null;
             try {
-                const r = await ctx.revalidate();
+                const r = await Promise.race([ctx.revalidate(), new Promise(function (resolve, reject) { timer = setTimeout(function () { reject(new Error('timeout')); }, CHECK_TIMEOUT_MS); })]);
                 if (closed) return;
                 if (r) { finish(reasonOf(r) || 'revoked'); return; }
                 const now = fingerprint(ctx);
                 if (now !== fp) finish('rights');
             } catch (ex) { finish('shutdown'); }
-            finally { checking = false; }
+            finally { clearTimeout(timer); checking = false; }
         };
         checkTimer = setInterval(check, o.revalidateMs);
         pingTimer = setInterval(function () { if (!closed) write(': ping\n\n'); }, o.pingMs);

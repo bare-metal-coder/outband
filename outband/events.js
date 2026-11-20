@@ -13,10 +13,11 @@
 
 'use strict';
 
-const { ApiError, FULL_RIGHTS, lastSegment } = require('./util');
-const { mapEvent, isAuditRecord, LIMITEVENTS } = require('./mappers');
+const { ApiError, FULL_RIGHTS } = require('./util');
+const { mapEvent, isAuditRecord, eventId, LIMITEVENTS } = require('./mappers');
 
-const MAX_WINDOW = 20000;
+/** Most stored MeshCentral events one listing can reach (an upper bound on the work of any request). */
+const MAX_DEPTH = 5000;
 
 function timeOf(ev) { const t = (ev.time instanceof Date) ? ev.time.getTime() : new Date(ev.time).getTime(); return Number.isFinite(t) ? t : 0; }
 
@@ -58,11 +59,22 @@ function visibleMeshIds(ctx) {
 function checkCursor(c) {
     if (c == null) return null;
     if ((typeof c.t != 'number') || !Number.isFinite(c.t) || (typeof c.i != 'string') || (c.i.length > 64)) throw new ApiError(400, 'invalid_request', 'Invalid cursor', { field: 'cursor' });
+    if ((c.d !== undefined) && (!Number.isInteger(c.d) || (c.d < 0) || (c.d > MAX_DEPTH))) throw new ApiError(400, 'invalid_request', 'Invalid cursor', { field: 'cursor' });
     return c;
 }
 
+/** (time, id) position of an event; positions order events newest first. */
+function posOf(ev) { return { t: timeOf(ev), i: eventId(ev) }; }
+function older(a, b) { return (a.t < b.t) || ((a.t == b.t) && (a.i < b.i)); } // a is older than b
+
 /**
- * Newest-first events the caller may see.
+ * Newest-first events the caller may see, from ONE bounded read of each
+ * source per request. The cursor is a scan position `{t, i, d}`: everything
+ * strictly older than (t, i) has not been looked at yet, and `d` is how many
+ * stored MeshCentral events were already read from the top. A page can hold
+ * fewer than `limit` items (even none) while `next` is set: continue from it.
+ * `next` is null only when the history is exhausted, or when the read depth
+ * (MAX_DEPTH stored MeshCentral events) is reached.
  * @param {object} f {device, group, type, audit, since, until} (short ids)
  */
 async function collect(ctx, f, limit, cursor) {
@@ -75,10 +87,9 @@ async function collect(ctx, f, limit, cursor) {
     const since = f.since ? f.since.getTime() : null, until = f.until ? f.until.getTime() : null;
     const pred = function (ev) {
         const audit = isAuditRecord(ev);
-        const t = timeOf(ev), id = String(ev._id);
+        const t = timeOf(ev);
         if ((since != null) && (t < since)) return false;
         if ((until != null) && (t >= until)) return false;
-        if (cursor && !((t < cursor.t) || ((t == cursor.t) && (id < cursor.i)))) return false;
         if (f.type && ((audit ? ev.type : ev.etype) !== f.type)) return false;
         if (fullNode && ((audit ? ev.device_id : ev.nodeid) !== fullNode)) return false;
         if (fullMesh && ((audit ? ev.group_id : ev.meshid) !== fullMesh)) return false;
@@ -89,27 +100,59 @@ async function collect(ctx, f, limit, cursor) {
     else if (fullMesh) ids = [fullMesh];
     else if (ctx.domainWideEvents()) ids = ['*'];
     else ids = visibleMeshIds(ctx).concat([ctx.userid]);
+    // Everything the audit store can filter is filtered there, including the cursor position.
     const q = { domain: domain };
     if (f.type) q.type = f.type;
     if (fullNode) q.device_id = fullNode;
     if (fullMesh) q.group_id = fullMesh;
-    if ((since != null) || (until != null)) { q.time = {}; if (since != null) q.time.$gte = since; if (until != null) q.time.$lt = until; }
+    const tq = {};
+    if (since != null) tq.$gte = since;
+    const upper = (until != null) ? until : null;
+    if (upper != null) tq.$lt = upper;
+    if (Object.keys(tq).length > 0) q.time = tq;
 
-    let W = Math.min(Math.max(limit * 3, 60), 5000), all = [], exhausted = false;
-    for (let round = 0; round < 6; round++) {
-        const parts = await Promise.all([
-            (f.audit === true) ? [] : dbEvents(ctx, ids, W),
-            (f.audit === false) ? [] : ctx.core.audit.find(q, W, cursor).then(function (r) { return r.items; })
-        ]);
-        all = parts[0].concat(parts[1]).filter(pred).sort(function (a, b) { const d = timeOf(b) - timeOf(a); return (d != 0) ? d : (String(b._id) < String(a._id) ? -1 : 1); });
-        exhausted = (parts[0].length < W) && (parts[1].length < W);
-        if ((all.length > limit) || exhausted || (W >= MAX_WINDOW)) break;
-        W = Math.min(W * 4, MAX_WINDOW);
+    const W = Math.min(Math.max(limit * 5, 100), 1000);
+    const depth = cursor ? (cursor.d || 0) : 0;
+    const D = Math.min(MAX_DEPTH, depth + W);
+    const wantMc = (f.audit !== true) && (depth < MAX_DEPTH);
+    const wantAudit = (f.audit !== false);
+    const parts = await Promise.all([
+        wantMc ? dbEvents(ctx, ids, D) : [],
+        wantAudit ? ctx.core.audit.find(q, W, cursor).then(function (r) { return r.items; }) : []
+    ]);
+    const byNewest = function (a, b) { const x = posOf(a), y = posOf(b); return older(x, y) ? 1 : (older(y, x) ? -1 : 0); };
+    const mcRaw = parts[0].slice().sort(byNewest), auRaw = parts[1].slice().sort(byNewest);
+
+    // Where each source stops being complete: a source that returned a full read may hold more below its last row.
+    let boundary = null;
+    const bound = function (raw, full) {
+        if (!full || (raw.length == 0)) return;
+        const p = posOf(raw[raw.length - 1]);
+        if ((since != null) && (p.t < since)) return; // reached the start of the requested range
+        if ((boundary == null) || older(boundary, p)) boundary = p;
+    };
+    const mcCapped = wantMc && (mcRaw.length >= D) && (D >= MAX_DEPTH); // nothing deeper is read
+    bound(mcRaw, wantMc && (mcRaw.length >= D) && !mcCapped);
+    bound(auRaw, wantAudit && (auRaw.length >= W));
+
+    const inRegion = function (ev) {
+        const p = posOf(ev);
+        if (cursor && !older(p, cursor)) return false;
+        if ((boundary != null) && older(p, boundary)) return false;
+        return true;
+    };
+    const cands = mcRaw.concat(auRaw).filter(inRegion).filter(pred).sort(byNewest);
+    const items = cands.slice(0, limit);
+    let pos = null;
+    if (cands.length > limit) pos = posOf(items[items.length - 1]);
+    else if (boundary != null) pos = boundary;
+    let next = null;
+    if (pos != null) {
+        // MeshCentral events read so far, down to this position
+        const d = wantMc ? mcRaw.filter(function (ev) { return !older(posOf(ev), pos); }).length : depth;
+        next = { t: pos.t, i: pos.i, d: Math.min(Math.max(d, depth), MAX_DEPTH) };
     }
-    const items = all.slice(0, limit);
-    const last = items[items.length - 1];
-    const more = (all.length > limit) || (!exhausted && items.length > 0);
-    return { items: items.map(function (ev) { return mapEvent(ctx, ev); }), next: (more && last) ? { t: timeOf(last), i: String(last._id) } : null };
+    return { items: items.map(function (ev) { return mapEvent(ctx, ev); }), next: next };
 }
 
-module.exports = { eventVisible, collect, visibleMeshIds, timeOf, lastSegment };
+module.exports = { eventVisible, collect, visibleMeshIds, timeOf, MAX_DEPTH };
