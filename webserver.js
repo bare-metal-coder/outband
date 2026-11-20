@@ -4,6 +4,7 @@
 * @copyright Intel Corporation 2018-2022
 * @license Apache-2.0
 * @version v0.0.1
+* Modified by the Outband project (see NOTICE)
 */
 
 /*jslint node: true */
@@ -201,6 +202,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     obj.renderPages = null;
     obj.renderLanguages = [];
     obj.destroyedSessions = {};                 // userid/req.session.x --> destroyed session time
+    obj.outband = require('./outband').create(obj, parent, { checkUserOneTimePasswordRequired, checkUserOneTimePassword, userHasSecondFactor, setSessionRandom }); // Outband: API core, session records
 
     const isWindowsPlatform = (obj.os.platform() === 'win32');
     const safeUploadTempRoots = (function () {
@@ -7320,18 +7322,14 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
         // Add HTTP security headers to all responses
         obj.app.use(async function (req, res, next) {
+            await obj.outband.ready; // Outband: session records and revocation list are loaded
             // Check if a session is destroyed
             if (typeof req.session.userid == 'string') {
-                if (typeof req.session.x == 'string') {
-                    if (obj.destroyedSessions[req.session.userid + '/' + req.session.x] != null) {
-                        delete req.session.userid;
-                        delete req.session.ip;
-                        delete req.session.t;
-                        delete req.session.x;
-                    }
-                } else {
-                    // Legacy session without a random, add one.
-                    setSessionRandom(req);
+                if ((typeof req.session.x != 'string') || (obj.destroyedSessions[req.session.userid + '/' + req.session.x] != null) || (obj.outband.sessionValid(req.session) == false)) { // Outband: no session id, revoked, or no valid session record
+                    delete req.session.userid;
+                    delete req.session.ip;
+                    delete req.session.t;
+                    delete req.session.x;
                 }
             }
 
@@ -7581,6 +7579,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 parent.pluginHandler.callHook('hook_setupHttpHandlers', obj, parent);
             }
             if (parent.multiServer != null) { obj.app.ws('/meshserver.ashx', function (ws, req) { parent.multiServer.CreatePeerInServer(parent.multiServer, ws, req, obj.args.tlsoffload == null); }); }
+            obj.app.use('/api/v1', obj.outband.router()); // Outband: /api/v1
             for (var i in parent.config.domains) {
                 if ((parent.config.domains[i].dns != null) || (parent.config.domains[i].share != null)) { continue; } // This is a subdomain with a DNS name, no added HTTP bindings needed.
                 var domain = parent.config.domains[i];
@@ -11177,6 +11176,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         var x = obj.crypto.randomBytes(6).toString('base64');
         while (obj.destroyedSessions[req.session.userid + '/' + x] != null) { x = obj.crypto.randomBytes(6).toString('base64'); }
         req.session.x = x;
+        obj.outband.onNewSession(req); // Outband: create the session record
     }
 
     // Remove all destroyed sessions after 2 hours, these sessions would have timed out anyway.
@@ -11246,6 +11246,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
     function checkAuthCookie(cookie, req) {
         if ((cookie.ip != null) && !checkCookieIp(cookie.ip, req.clientIp)) { parent.debug('web', 'ERR: Invalid cookie IP address, got \"' + cookie.ip + '\", expected \"' + cleanRemoteAddr(req.clientIp) + '\".'); return false; }
         if ((cookie.x != null) && (obj.destroyedSessions[cookie.userid + '/' + cookie.x] != null)) { parent.debug('web', 'ERR: Cookie issued to a session that has logged out.'); return false; }
+        if (obj.outband.checkAuthCookie(cookie) == false) { parent.debug('web', 'ERR: Cookie issued to an expired session.'); return false; } // Outband: session lifetime
         return true;
     }
 
