@@ -314,3 +314,4 @@ __pycache__/
 docs/__pycache__/
 docs/env/
 docker-compose.yaml
+public/app/
