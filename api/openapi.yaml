@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Outband API
-  version: 1.0.0-draft.6
+  version: 1.0.0-draft.7
   summary: Public, versioned HTTP API for Outband (a MeshCentral fork).
   description: |
     The Outband API is the only interface the Outband web UI uses. Third-party
@@ -9,6 +9,21 @@ info:
     MeshCentral's own internals: the same database, the same permission model
     and the same power and event functions that MeshCentral's own UI uses.
     Clients never need MeshCentral's internal websocket protocol.
+
+    ## Draft status
+    1.0.0-draft.N versions may contain breaking changes until 1.0.0.
+
+    **Changes since draft.5:**
+    * **Breaking:** `DeviceCapabilities.power_via` changed type from one
+      path per action (a string) to the list of default paths per action
+      (an array), for example `wake: [wol, amt]`.
+    * `via` always selects exactly one path, with allowed values per
+      action; actions whose default paths are unavailable are left out of
+      `power` and `power_via`, and get `409 not_reachable` without `via`.
+    * New `POST /api/v1/auth/reauth` for step-up.
+    * New `401 bearer_disabled` for the kill switch.
+    * Stream: control messages are always sent; reconnect rules and timing.
+    * New optional `Device.links.ui`.
 
     ## Conventions
     * **Versioning.** Every endpoint lives under `/api/v1`. Within v1, changes
@@ -145,9 +160,17 @@ info:
     value is stored in the database. Every server re-reads it at least every
     5 seconds, and the server that receives the change applies it at once.
     While it is off, every bearer request gets `401 bearer_disabled`, and
-    open bearer streams and consoles close within 5 seconds. The config.json
-    setting `outbandApi.bearer` is only the startup default, used until an
-    administrator stores a value.
+    open bearer streams and consoles close within 5 seconds. The server
+    answers `bearer_disabled` before it looks the token up, so such a
+    request reveals nothing about the token and does not update its
+    `last_used_at`. The config.json setting `outbandApi.bearer` is only the
+    startup default, used until an administrator stores a value.
+
+    The kill switch is not revocation: every token works again when bearer
+    authentication is turned back on. After a suspected token theft,
+    administrators revoke the affected tokens first
+    (`DELETE /api/v1/admin/tokens/{tokenId}`), and only then turn bearer
+    authentication back on.
 
     ## CSRF
     Every cookie-authenticated request that is not `GET`/`HEAD` needs both of
@@ -496,7 +519,7 @@ paths:
                 name: Outband
                 version: 1.3.1
                 outband_version: 0.1.0
-                api_version: 1.0.0-draft.6
+                api_version: 1.0.0-draft.7
                 features:
                   amt: true
                   twofa: { available: true, ip_exemptions: false, methods: [otp, email] }
@@ -688,9 +711,20 @@ paths:
            and answers `204`. To have a code sent, send
            `{"method": "email", "send": true}`; the server answers `202`.
 
-        A code without a password check in the last 5 minutes gets
-        `401 reauth_required`. A refused password gets
-        `401 invalid_credentials`, and a wrong code `401 invalid_code`.
+        `200` means "a second factor is needed next", `202` means "a code
+        was sent", and `204` means "done". A code with no pending
+        re-authentication on this session (no step 1 in the last 5 minutes,
+        or discarded after 5 wrong codes) gets `401 reauth_required`. A
+        refused password gets `401 invalid_credentials`, and a wrong code
+        `401 invalid_code`. A body that mixes the steps (`password` together
+        with `code`, `method` or `send`; or `code` together with `send`) gets
+        `400 invalid_request` with `details.field` naming the field that may
+        not be combined.
+
+        **State.** The pending re-authentication is kept on the server,
+        attached to the existing session record, never in the cookie. It
+        expires 5 minutes after step 1 and has the same wrong-code and
+        code-send counters as a pending login. A new step 1 replaces it.
 
         **Limits.** Password failures count towards the same per-account
         counter and lock as login (10 in 15 minutes locks API logins and
@@ -721,16 +755,17 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ReauthPending' }
-              example: { twofa: { required: true, methods: [otp, email] } }
+              example: { twofa: { required: true, methods: [otp, email], expires_at: '2026-01-01T12:05:00Z' } }
         '202':
           description: A code was sent through the requested method.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401':
-          description: '`unauthenticated` (no valid session), `invalid_credentials`, `invalid_code`, or `reauth_required` (a code without a recent password check).'
+          description: '`unauthenticated` (no valid session), `invalid_credentials`, `invalid_code`, or `reauth_required` (a code with no pending re-authentication).'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '421': { $ref: '#/components/responses/InvalidHost' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
@@ -1163,6 +1198,15 @@ paths:
         `details: {path: agent, available_paths: [amt]}`; and
         `{"action": "off", "via": "amt"}` performs a hard power-off.
 
+        **MQTT.** MQTT is never a default path on its own: it is added to
+        the agent path when both are connected (`power_via.off` is then
+        `[agent, mqtt]`). For a device reachable only over MQTT (agent
+        offline), the same rule applies: `off`, `reset` and `sleep` are not
+        in `power` or `power_via`, `power_paths` lists `mqtt` for them, a
+        request without `via` gets `409` with
+        `details: {path: agent, available_paths: [mqtt]}`, and the request
+        must carry `"via": "mqtt"`.
+
         **Result.** MeshCentral power commands do not wait for the device, so
         `202` means "dispatched". The state change arrives as a
         `device.power` stream event.
@@ -1449,8 +1493,15 @@ paths:
         | `rights` | retryable | Rights changed. Reconnect with backoff; the new stream reflects the new rights. |
         | `shutdown` | retryable | The server is restarting. Reconnect with backoff. |
 
-        Unknown reasons are retryable. If a reconnect answers `401` with
-        `token_revoked` or `token_expired`, or `403`, stop.
+        Unknown reasons are retryable. When a reconnect is answered with an
+        error instead of a stream:
+        * `401 unauthenticated`: stop. Browsers go to the login page (for
+          example, the session passed its lifetime limit or was logged out
+          elsewhere). Integrations stop and report the token as not
+          recognised.
+        * `401 token_revoked` or `401 token_expired`, or any `403`: stop.
+        * `401 bearer_disabled`, `429` or `503`: retry on the schedule
+          below (honour `Retry-After` when present).
 
         **Retry timing.** Every client, including browser `EventSource`
         (which applies `retry:` itself but does not expose it to scripts),
@@ -1814,7 +1865,7 @@ components:
     ReauthRequest:
       type: object
       additionalProperties: false
-      description: 'Step 1: `password`. Step 2: `code` (optionally `method`), or `method` with `send: true`. Exactly one step per request.'
+      description: 'Step 1: `password` alone. Step 2: `code` (optionally with `method`), or `method` with `send: true`. Exactly one step per request; a mixed body gets `400 invalid_request` with `details.field`.'
       properties:
         password: { type: string, minLength: 1, maxLength: 1024, writeOnly: true }
         code: { type: string, minLength: 4, maxLength: 64, writeOnly: true }
