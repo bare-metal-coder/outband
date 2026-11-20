@@ -168,7 +168,7 @@ test('central scope check before idempotency; power rights before path details; 
         await c.login('alice', users.alice.password);
         const tok = await c.post('/api/v1/auth/tokens', { json: { name: 'ro', scopes: ['read'] } });
         const b = h.client();
-        let r = await call(b, 'POST', '/api/v1/devices/EXAMPLEnodeId0000/power', { bearer: tok.body.secret, csrf: false, json: { action: 'off' }, headers: { 'idempotency-key': 'key-12345678' } });
+        let r = await call(b, 'POST', '/api/v1/devices/EXAMPLEnodeId0000/power', { bearer: tok.body.secret, csrf: false, json: { action: 'off' }, headers: { 'idempotency-key': 'retry-0001-example' } }); // test value, not a secret
         assert.strictEqual(r.status, 403); assert.strictEqual(r.body.error.code, 'insufficient_scope');
         r = await call(b, 'POST', '/api/v1/devices/EXAMPLEnodeId0000/console/sol/ticket', { bearer: tok.body.secret, csrf: false });
         assert.strictEqual(r.status, 403); assert.strictEqual(r.body.error.code, 'insufficient_scope');
