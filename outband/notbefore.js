@@ -54,12 +54,14 @@ function parseState(fp) {
 
 /**
  * True when moving from state `prev` to `cur` is a credential change: a reset
- * requested, or `passchange` set to a different positive value. A backward move
- * counts too, so a new password stamped by a server with a clock behind is not missed.
+ * requested, `passchange` set to a different positive value, or a positive
+ * `passchange` removed (fail closed). A backward move counts too, so a new
+ * password stamped by a server with a clock behind is not missed.
  */
 function isCredentialChange(prev, cur) {
     if (cur === -1) return (prev !== -1); // reset requested
-    return (cur > 0) && (cur !== prev); // a new password (including out of a reset)
+    if (cur === 0) return (prev > 0); // a positive passchange removed: fail closed
+    return (cur !== prev); // a new password (including out of a reset)
 }
 
 /** The earlier stored format (hash of salt, hash, passtype and the reset flag), used once to migrate. */
@@ -109,7 +111,7 @@ class NotBefore {
             } else if (isCredentialChange(prev, cur)) {
                 this._advance(user._id, rec, fp);
             } else {
-                rec.fp = fp; // a reset flag or passchange cleared without a new password: no change of credential
+                rec.fp = fp; // a reset flag cleared without a new password: no change of credential
                 this._save(user._id, rec);
             }
         }

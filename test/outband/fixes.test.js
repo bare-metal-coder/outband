@@ -163,7 +163,8 @@ test('not_before: state transitions and migration of stored records', async func
     assert.strictEqual(isCredentialChange(-1, -1), false);
     assert.strictEqual(isCredentialChange(1600000000, 1600000000), false);
     assert.strictEqual(isCredentialChange(1600000100, 1600000000), true, 'passchange moving back (server clock behind) is a new password');
-    assert.strictEqual(isCredentialChange(1600000000, 0), false, 'passchange cleared without a password');
+    assert.strictEqual(isCredentialChange(1600000000, 0), true, 'a positive passchange removed fails closed');
+    assert.strictEqual(isCredentialChange(0, 0), false);
     assert.strictEqual(isCredentialChange(-1, 0), false, 'reset flag cleared without a password');
 
     const store = await openStore({ inMemory: true });
@@ -232,6 +233,27 @@ test('not_before: passchange moving backward (new password, server clock behind)
         assert.strictEqual((await call(c, 'GET', '/api/v1/server')).status, 401);
         const c2 = h.client();
         assert.strictEqual((await c2.login('alice', skewed.alice.password)).status, 200);
+        assert.strictEqual((await call(c2, 'GET', '/api/v1/server')).status, 200, 'new logins work');
+    });
+});
+
+test('not_before: a positive passchange removed revokes (fail closed)', async function () {
+    const set = { admin: users.admin, alice: { password: 'Alice-Pass-1', passchange: Math.floor(Date.now() / 1000) - 60 } };
+    await withServer({ users: set }, async function (h) {
+        const c = h.client();
+        await c.login('alice', set.alice.password);
+        const tok = await c.post('/api/v1/auth/tokens', { json: { name: 'ro', scopes: ['read'] } });
+        const b = h.client();
+        assert.strictEqual((await call(b, 'GET', '/api/v1/server', { bearer: tok.body.secret })).status, 200);
+        await new Promise(function (r) { setTimeout(r, 5); });
+        for (const u of [h.dbDocs['user//alice'], h.users['user//alice']]) { delete u.passchange; }
+        const r = await call(b, 'GET', '/api/v1/server', { bearer: tok.body.secret });
+        assert.strictEqual(r.status, 401); assert.strictEqual(r.body.error.code, 'token_revoked');
+        assert.strictEqual((await call(c, 'GET', '/api/v1/server')).status, 401);
+        const d = await h.core.store.tokens.findOne({ _id: tok.body.token.id });
+        assert.strictEqual(d.revoked_reason, 'credentials_changed');
+        const c2 = h.client();
+        assert.strictEqual((await c2.login('alice', set.alice.password)).status, 200);
         assert.strictEqual((await call(c2, 'GET', '/api/v1/server')).status, 200, 'new logins work');
     });
 });
