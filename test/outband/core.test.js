@@ -184,10 +184,10 @@ test('deleted or locked users and password changes end sessions', async function
         assert.strictEqual(r.status, 401);
         h.dbDocs['user//alice'].siteadmin = 0;
         await c.login('alice', ALICE.password);
-        h.dbDocs['user//alice'].passchange = Math.floor(Date.now() / 1000) + 5;
+        for (const u of [h.dbDocs['user//alice'], h.users['user//alice']]) { u.passchange = Math.floor(Date.now() / 1000) + 5; } // MeshCentral updates both copies
         r = await call(c, 'GET', '/api/v1/server');
         assert.strictEqual(r.status, 401);
-        delete h.dbDocs['user//alice'].passchange;
+        for (const u of [h.dbDocs['user//alice'], h.users['user//alice']]) { delete u.passchange; }
         await c.login('alice', ALICE.password);
         delete h.dbDocs['user//alice'];
         r = await call(c, 'GET', '/api/v1/server');
@@ -306,10 +306,12 @@ test('tokens: create, use per request, scopes, revoke, expiry, allowed_ips, TLS'
         h.dbDocs['user//alice'].siteadmin = 0;
         assert.strictEqual((await call(b, 'GET', '/api/v1/server', { bearer: secret })).status, 200);
         // Password change revokes tokens
-        h.dbDocs['user//alice'].passchange = Math.floor(Date.now() / 1000) + 5;
+        for (const u of [h.dbDocs['user//alice'], h.users['user//alice']]) { u.passchange = Math.floor(Date.now() / 1000) + 5; } // MeshCentral updates both copies
         r = await call(b, 'GET', '/api/v1/server', { bearer: secret });
         assert.strictEqual(r.body.error.code, 'token_revoked');
-        delete h.dbDocs['user//alice'].passchange;
+        for (const u of [h.dbDocs['user//alice'], h.users['user//alice']]) { delete u.passchange; }
+        assert.strictEqual((await call(c, 'GET', '/api/v1/server')).status, 401, 'the password change also ended the session');
+        await c.login('alice', ALICE.password);
         // List, revoke
         r = await call(c, 'GET', '/api/v1/auth/tokens');
         assert.strictEqual(r.body.items.length, 1);

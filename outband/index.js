@@ -105,7 +105,7 @@ function create(webserver, parent, hooks, options) {
         core.pseudonyms = new Pseudonyms(store);
         core.settings = new RuntimeSettings(store, core.config, core.bus);
         core.idempotency = new Idempotency(store);
-        core.notBefore = new NotBefore(store, core.bus);
+        core.notBefore = new NotBefore(store, core.bus, function () { return webserver.users; });
         await core.notBefore.load();
         await core.pseudonyms.load();
         await core.settings.load();

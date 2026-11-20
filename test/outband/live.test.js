@@ -237,6 +237,26 @@ liveTest('live MeshCentral', { timeout: 900000 }, async function (t) {
         assert.strictEqual(await controlSession(cookie), false, 'control.ashx refuses it');
         assert.ok(!loggedInOnLegacy(await request('GET', '/', { cookie: cookie })), 'legacy UI refuses it');
     });
+
+    await t.test('not_before: a restart keeps tokens and sessions; a command-line password reset ends them', async function () {
+        const r = await api('POST', '/api/v1/auth/login', { csrf: true, json: { username: 'alice', password: PASS.alice } });
+        const cookie = r.cookie;
+        const tk = await api('POST', '/api/v1/auth/tokens', { csrf: true, cookie: cookie, json: { name: 'live-nb', scopes: ['read'] } });
+        assert.strictEqual(tk.status, 201, tk.text);
+        await stopServer();
+        await startServer(env.dir);
+        assert.strictEqual((await api('GET', '/api/v1/server', { bearer: tk.body.secret })).status, 200, 'token survives a restart');
+        assert.strictEqual((await api('GET', '/api/v1/server', { cookie: cookie })).status, 200, 'session survives a restart');
+        await stopServer();
+        mc(env.dir, ['--resetaccount', 'alice', '--pass', PASS.alice + '-new']);
+        await startServer(env.dir);
+        const gone = await api('GET', '/api/v1/server', { bearer: tk.body.secret });
+        assert.strictEqual(gone.status, 401); assert.strictEqual(gone.body.error.code, 'token_revoked');
+        assert.strictEqual((await api('GET', '/api/v1/server', { cookie: cookie })).status, 401, 'session ended');
+        const again = await api('POST', '/api/v1/auth/login', { csrf: true, json: { username: 'alice', password: PASS.alice + '-new' } });
+        assert.strictEqual(again.status, 200);
+        assert.strictEqual((await api('GET', '/api/v1/server', { cookie: again.cookie })).status, 200);
+    });
 });
 
 /** Add a device group, one device and a user link to a prepared data directory (NeDB: the last line per _id wins). */

@@ -4,6 +4,7 @@
 * @copyright Intel Corporation 2018-2022
 * @license Apache-2.0
 * @version v0.0.1
+* Modified by the Outband project (see NOTICE)
 */
 
 /*xjslint node: true */
@@ -1162,12 +1163,14 @@ function CreateMeshCentralServer(config, args) {
                                     if (hashpasssplit.length != 2) { console.log("Invalid hashed password."); process.exit(); return; }
                                     user.salt = hashpasssplit[0];
                                     user.hash = hashpasssplit[1];
+                                    user.passchange = Math.floor(Date.now() / 1000); // Outband: a new password moves passchange forward
                                     obj.db.Set(user, function () { console.log("Done. This command will only work if MeshCentral is stopped."); process.exit(); return; });
                                 } else if (obj.args.pass && (typeof obj.args.pass == 'string')) {
                                     // Hash the password and reset the account.
                                     require('./pass').hash(String(obj.args.pass), user.salt, function (err, hash, tag) {
                                         if (err) { console.log("Unable to reset password: " + err); process.exit(); return; }
                                         user.hash = hash;
+                                        user.passchange = Math.floor(Date.now() / 1000); // Outband: a new password moves passchange forward
                                         obj.db.Set(user, function () { console.log("Done."); process.exit(); return; });
                                     }, 0);
                                 } else {
