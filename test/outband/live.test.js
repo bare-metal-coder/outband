@@ -259,7 +259,7 @@ function sse(o) {
         const headers = { host: HOST };
         if (o.cookie) headers.cookie = o.cookie;
         if (o.bearer) headers.authorization = 'Bearer ' + o.bearer;
-        const req = https.request({ host: '127.0.0.1', port: PORT, servername: NAME, method: 'GET', path: '/api/v1/stream' + (o.query || ''), headers: headers, rejectUnauthorized: false, agent: false }, function (res) {
+        const req = https.request({ host: '127.0.0.1', port: PORT, servername: NAME, method: 'GET', path: '/api/v1/stream' + (o.query || ''), headers: headers, ca: fs.readFileSync(path.join(o.dir, 'root-cert-public.crt')), agent: false }, function (res) {
             const s = { status: res.statusCode, headers: res.headers, raw: '', messages: [], ended: false, close: function () { req.destroy(); } };
             let buf = '';
             res.setEncoding('utf8');
@@ -331,7 +331,7 @@ liveTest('live MeshCentral resources: groups, devices, events, stream', { timeou
 
     await t.test('stream: ready, and it ends with closed within 5 seconds of a revocation', async function () {
         const tk = await api('POST', '/api/v1/auth/tokens', { csrf: true, cookie: alice, json: { name: 'live-stream', scopes: ['read'] } });
-        const s = await sse({ bearer: tk.body.secret, query: '?types=device.power,device.updated,resync' });
+        const s = await sse({ dir: env.dir, bearer: tk.body.secret, query: '?types=device.power,device.updated,resync' });
         assert.strictEqual(s.status, 200);
         assert.match(s.headers['content-type'], /^text\/event-stream/);
         assert.ok(await s.waitFor(function (x) { return x.messages.some(function (m) { return m.type == 'ready'; }); }));
@@ -344,7 +344,7 @@ liveTest('live MeshCentral resources: groups, devices, events, stream', { timeou
         assert.strictEqual(s.messages.filter(function (m) { return m.type == 'closed'; })[0].data.reason, 'revoked');
         // a session stream ends on logout, and frees its slot
         const c2 = await login('alice');
-        const s2 = await sse({ cookie: c2 });
+        const s2 = await sse({ dir: env.dir, cookie: c2 });
         assert.ok(await s2.waitFor(function (x) { return x.messages.length > 0; }));
         await api('POST', '/api/v1/auth/logout', { csrf: true, cookie: c2 });
         assert.ok(await s2.waitFor(function (x) { return x.messages.some(function (m) { return m.type == 'closed' && m.data.reason == 'logout'; }); }, 5000));

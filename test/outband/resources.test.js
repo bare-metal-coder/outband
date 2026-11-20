@@ -364,7 +364,7 @@ test('stream: types filter, unknown names ignored, control messages always sent'
     await withWorld(async function (h) {
         const alice = await session(h, 'alice');
         const s = await open(h, { client: alice, query: '?types=device.power,made.up.type,,resync' });
-        h.dispatch({ action: 'nodeconnect', meshid: MA, nodeid: FN3.replace('node//', 'node//'), domain: '', conn: 4, pwr: 1, nolog: 1 });
+        h.dispatch({ action: 'nodeconnect', meshid: MA, nodeid: FN3, domain: '', conn: 4, pwr: 1, nolog: 1 });
         h.dispatch({ action: 'nodeconnect', meshid: MA, nodeid: FN1, domain: '', conn: 5, pwr: 8, nolog: 1 });
         await s.waitFor(function (x) { return x.of('device.power').length >= 1; });
         await tick();
