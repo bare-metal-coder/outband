@@ -10,13 +10,32 @@
 export class ApiError extends Error {
   readonly status: number;
   readonly body: unknown;
+  /** Seconds from the `Retry-After` header (429), when sent. */
+  readonly retryAfter: number | null;
 
-  constructor(status: number, body: unknown, message?: string) {
+  constructor(status: number, body: unknown, message?: string, retryAfter: number | null = null) {
     super(message ?? errorMessage(body) ?? `Request failed (${status})`);
     this.name = 'ApiError';
     this.status = status;
     this.body = body;
+    this.retryAfter = retryAfter;
   }
+
+  /** The spec's stable error code (`{error: {code}}`), or null. */
+  get code(): string | null {
+    return errorCode(this.body);
+  }
+
+  /** `error.details`, e.g. `{path: 'amt'}` on a denied power path. */
+  get details(): Record<string, unknown> | null {
+    const e = (this.body as { error?: { details?: unknown } } | undefined)?.error;
+    return e?.details && typeof e.details === 'object' ? (e.details as Record<string, unknown>) : null;
+  }
+}
+
+export function errorCode(body: unknown): string | null {
+  const e = (body as { error?: { code?: unknown } } | null | undefined)?.error;
+  return e && typeof e.code === 'string' ? e.code : null;
 }
 
 /** Network failure: the request never got an HTTP response. */
@@ -45,6 +64,8 @@ export type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 export interface RequestOptions {
   body?: unknown;
   query?: Record<string, string | number | boolean | undefined | null>;
+  /** Extra request headers (e.g. `Idempotency-Key`). */
+  headers?: Record<string, string>;
   signal?: AbortSignal;
   /** Return the decoded body for these non-2xx statuses instead of throwing. */
   accept?: number[];
@@ -71,7 +92,7 @@ export function buildUrl(path: string, query?: RequestOptions['query']): string 
 }
 
 export async function request<T>(method: Method, path: string, opts: RequestOptions = {}): Promise<T> {
-  const headers: Record<string, string> = { Accept: 'application/json' };
+  const headers: Record<string, string> = { Accept: 'application/json', ...opts.headers };
   if (method !== 'GET') headers['X-Outband'] = '1';
   let body: string | undefined;
   if (opts.body !== undefined) {
@@ -95,7 +116,8 @@ export async function request<T>(method: Method, path: string, opts: RequestOpti
 
   const data = await decode(res);
   if (res.ok || opts.accept?.includes(res.status)) return data as T;
-  throw new ApiError(res.status, data);
+  const ra = Number(res.headers.get('retry-after'));
+  throw new ApiError(res.status, data, undefined, Number.isFinite(ra) && ra > 0 ? ra : null);
 }
 
 async function decode(res: Response): Promise<unknown> {

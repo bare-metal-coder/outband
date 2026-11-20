@@ -13,7 +13,7 @@ export interface paths {
         };
         /**
          * Liveness and readiness
-         * @description Needs no authentication. Shows nothing about configuration.
+         * @description Needs no authentication, and shows nothing about the configuration.
          */
         get: operations["getHealth"];
         put?: never;
@@ -31,10 +31,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /**
-         * Server name, version and enabled features
-         * @description Needs authentication (any scope), because it reveals the version.
-         */
+        /** Server name, version and features */
         get: operations["getServer"];
         put?: never;
         post?: never;
@@ -53,12 +50,12 @@ export interface paths {
         };
         /**
          * Current authentication state
-         * @description Needs no authentication. With no credential it returns
-         *     `authenticated: false`. After a correct password, while the second
-         *     factor is still pending, it returns `authenticated: false` and
-         *     `twofa.pending: true` with the methods. `server` only carries
-         *     `name`, so an anonymous caller can render a login page without
-         *     learning the version.
+         * @description Needs no authentication. With no valid credential, or during a
+         *     pending login, it returns `authenticated: false` (with
+         *     `twofa.required: true` during a pending login). `server.version` is
+         *     only present when authenticated. With a token, `user.email` and
+         *     `user.siteadmin` are left out unless the token has the `identity`
+         *     scope.
          */
         get: operations["getSession"];
         put?: never;
@@ -79,15 +76,14 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Log in with username and password (browser session)
-         * @description Checks credentials with MeshCentral's own `authenticate` function.
-         *     That function applies the same lockout, invalid-login rate limits,
-         *     LDAP/other configured backends and password checks as the legacy
-         *     login. On success it sets the MeshCentral session cookie. If the user
-         *     has two-factor enabled, the server keeps the session in a pending
-         *     state and the client completes it with `/api/v1/auth/2fa`.
-         *     Needs `X-Outband: 1` and a valid Origin (the cookie CSRF rule
-         *     applies even before login).
+         * Log in with username and password
+         * @description Checks the credentials with MeshCentral's own authentication
+         *     (including configured LDAP or other backends). On success it creates
+         *     a new MeshCentral session with a new session id, and the session
+         *     record. If a second factor is required, it starts a pending login
+         *     instead (see Two-factor login). The response for every refusal is the
+         *     same `401 invalid_credentials`. Needs `X-Outband: 1` and a matching
+         *     `Origin`. No `RateLimit-*` headers.
          */
         post: operations["login"];
         delete?: never;
@@ -107,13 +103,13 @@ export interface paths {
         put?: never;
         /**
          * Complete a pending login with a second factor
-         * @description Checks the code with MeshCentral's existing 2FA logic (TOTP, backup
-         *     codes, email/SMS/messaging codes, YubiKey OTP). The `method` field is
-         *     optional; when it is missing the server tries the methods MeshCentral
-         *     accepts for a typed code. To have an email or SMS code sent, call
-         *     this once with `{"method": "email", "send": true}` and no token; the
-         *     server answers `202`. WebAuthn/FIDO keys are not supported by the v1
-         *     API; users with only a hardware key use `/legacy`.
+         * @description Checks `code` with MeshCentral's own second-factor logic (TOTP,
+         *     backup codes, email, SMS or messaging codes, YubiKey OTP). `method`
+         *     is optional. To have a code sent, send
+         *     `{"method": "email", "send": true}` without a code; the server
+         *     answers `202`. On success the pending login becomes a full session
+         *     with a new session id, and `last_auth_2fa` is set. See Two-factor
+         *     login for the limits. No `RateLimit-*` headers.
          */
         post: operations["loginSecondFactor"];
         delete?: never;
@@ -133,7 +129,10 @@ export interface paths {
         put?: never;
         /**
          * End the browser session
-         * @description Clears the MeshCentral session cookie. Succeeds even when the caller was not logged in.
+         * @description Clears the session cookie and puts the session on the persisted
+         *     revocation list, so it stops working on every endpoint, also after a
+         *     restart. Streams and consoles opened by this session close within 5
+         *     seconds. Succeeds even when the caller was not logged in.
          */
         post: operations["logout"];
         delete?: never;
@@ -151,17 +150,18 @@ export interface paths {
         };
         /**
          * List the caller's API tokens
-         * @description Browser session only. Secrets are never returned.
+         * @description Browser session only. Includes expired and revoked tokens for 30 days. Secrets are never returned.
          */
         get: operations["listTokens"];
         put?: never;
         /**
          * Create an API token for the caller
-         * @description Browser session only: a token cannot create tokens. The token acts as
-         *     the creating user, limited by its scopes. If the user's MeshCentral
-         *     rights shrink later, the token's power shrinks with them. The
-         *     `secret` appears in this response only. The server stores
-         *     `sha256(secret)`. A user can hold at most 50 live tokens.
+         * @description Browser session only. Give either `scopes` or `profile`, not both.
+         *     The token acts as the caller, limited by its scopes, `groups` and
+         *     `allowed_ips`. See Scopes for lifetime limits and Credentials for
+         *     step-up (`401 reauth_required`). A user can hold at most 50 live
+         *     tokens. The response is the only time the secret is shown, and the
+         *     server never logs it.
          */
         post: operations["createToken"];
         delete?: never;
@@ -175,7 +175,7 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
-                tokenId: string;
+                tokenId: components["parameters"]["TokenId"];
             };
             cookie?: never;
         };
@@ -184,11 +184,77 @@ export interface paths {
         post?: never;
         /**
          * Revoke one of the caller's tokens
-         * @description Takes effect at once, including for open SSE streams that use the
-         *     token, which close within 5 seconds. The token record stays with
-         *     `revoked_at` set, for auditing.
+         * @description Browser session only. Takes effect at once; streams and consoles using the token close within 5 seconds. The record stays, with `revoked_at` set.
          */
         delete: operations["revokeToken"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List every user's API tokens
+         * @description Full site administrators, browser session only (not login-token sessions). Secrets and hashes are never returned.
+         */
+        get: operations["adminListTokens"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/tokens/{tokenId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tokenId: components["parameters"]["TokenId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke any user's token
+         * @description Full site administrators, browser session only. Takes effect at once. Audited with both the admin and the owner.
+         */
+        delete: operations["adminRevokeToken"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Runtime API settings
+         * @description Full site administrators, browser session only.
+         */
+        get: operations["adminGetSettings"];
+        /**
+         * Change runtime API settings (bearer kill switch)
+         * @description Full site administrators, browser session only, with step-up. Stored,
+         *     and in effect at once (see Kill switch). Audited, in both directions.
+         *     Fields that are left out stay unchanged.
+         */
+        put: operations["adminPutSettings"];
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -201,10 +267,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /**
-         * Device groups visible to the caller
-         * @description Small enough to return whole (no pagination), as the legacy UI does.
-         */
+        /** Device groups visible to the caller */
         get: operations["listGroups"];
         put?: never;
         post?: never;
@@ -282,20 +345,37 @@ export interface paths {
         put?: never;
         /**
          * Perform a power action
-         * @description The server picks the path in this order:
-         *     * `on` and `cycle`: Intel AMT only.
-         *     * `off` and `reset`: the agent if it is connected, else Intel AMT.
-         *     * `sleep`: the agent only.
-         *     * `wake`: Wake-on-LAN through peer agents, plus AMT power-up if AMT
-         *       is reachable. The same dispatch as MeshCentral's `wakedevices`.
-         *     * Devices in IP-KVM/PDU groups use the port operation. MQTT devices
-         *       also get the MQTT power message, as in MeshCentral.
+         * @description **Paths.** With `via`, the server uses only that path. If the caller
+         *     lacks the right for that path, the answer is `403 forbidden` with
+         *     `details.path`. If the path cannot carry the action now, the answer
+         *     is `409 not_reachable`. Nothing is dispatched in either case, and the
+         *     server never falls back to another path. Without `via`, the default
+         *     path is:
+         *     * `on`: AMT power-up (IP-KVM/PDU groups: port on).
+         *     * `wake`: Wake-on-LAN from peer agents, plus AMT power-up when AMT is
+         *       reachable and allowed (IP-KVM/PDU groups: port on).
+         *     * `off` and `reset`: **the agent only**, a graceful OS operation. A
+         *       hard power-off or reset through AMT needs `"via": "amt"` (IP-KVM/PDU
+         *       groups: `off` turns the port off).
+         *     * `cycle`: AMT (it has no other path).
+         *     * `sleep`: the agent.
+         *     * When the device is connected over MQTT, the MQTT power message is
+         *       sent along with the agent path.
+         *     `capabilities.power_via` shows each action's default path, and
+         *     `capabilities.power_paths` shows every path available now.
          *
-         *     MeshCentral power commands do not wait for the device. The response
-         *     means the command was dispatched, not that it finished. The resulting
-         *     state change arrives as a `device.power` stream event and in the
-         *     device's `power` field. Scope `power` is required; see the rights
-         *     table in the API description.
+         *     **Result.** MeshCentral power commands do not wait for the device, so
+         *     `202` means "dispatched". The state change arrives as a
+         *     `device.power` stream event.
+         *
+         *     **Idempotency.** Send `Idempotency-Key` to make retries safe. A repeat
+         *     with the same key and the same body, from the same credential within
+         *     24 hours, returns the original result without dispatching again. The
+         *     same key with a different body gets `409 idempotency_conflict`.
+         *
+         *     **Limits and audit.** Scope `power_on` or `power_off` (see
+         *     Authorization). Per-device limit of 6 per minute. Dispatched and
+         *     denied attempts are both audited, with `action_id`.
          */
         post: operations["powerAction"];
         delete?: never;
@@ -313,7 +393,10 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Events for one device (newest first) */
+        /**
+         * Events for one device (newest first)
+         * @description The visibility and privacy rules for events apply (see Authorization and Privacy).
+         */
         get: operations["listDeviceEvents"];
         put?: never;
         post?: never;
@@ -336,27 +419,36 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Get a single-use ticket to open a console WebSocket
-         * @description Checks the `console` scope and the rights for `kind` (see the rights
-         *     table), then returns a random ticket. The ticket is bound to this
-         *     user, device, kind and credential. It lasts 60 seconds and works
-         *     once. Revoking the token or logging out makes unused tickets
-         *     invalid. Opening the console is audited.
+         * Get a single-use ticket for a console WebSocket
+         * @description Checks visibility, scope `console`, the rights for `kind` (denials
+         *     are audited) and reachability. Then it returns a random 256-bit
+         *     ticket, bound to this user, device, kind and credential. The ticket
+         *     is valid for 60 seconds and works once. Logout or revocation cancels
+         *     unused tickets. The response body is never logged.
          *
-         *     **WebSocket:** `GET /api/v1/devices/{deviceId}/console/{kind}?ticket=...`
-         *     with `Upgrade: websocket`. The WebSocket also needs a valid `Origin`
-         *     unless the ticket was issued to a bearer token. Frames:
-         *     * `sol`: binary frames carry raw terminal bytes in both directions
-         *       (VT100/ANSI from the managed host's serial console). Text frames
-         *       carry JSON control messages: `{"type":"state","state":"connecting|open|closed","reason":...}`
-         *       from the server, and `{"type":"resize","cols":N,"rows":N}` from the
-         *       client (ignored for SOL).
-         *     * `terminal` (later): the same framing, backed by the agent's shell
-         *       relay.
-         *     Close codes: 4401 bad or expired ticket, 4403 rights changed, 4409
-         *     device not reachable, 1011 server error. The server proxies the
-         *     stream through MeshCentral's existing relay (AMT redirection for
-         *     SOL), so AMT credentials never leave the server.
+         *     **WebSocket.** Open `url` (which does not contain the ticket) and
+         *     pass the values in `protocols` as WebSocket subprotocols:
+         *     `new WebSocket(url, ticket.protocols)`, which sends
+         *     `Sec-WebSocket-Protocol: outband.console.v1, outband.ticket.<ticket>`.
+         *     The server answers with `outband.console.v1` only. Tickets are not
+         *     accepted in the URL. At the upgrade the server marks the ticket used
+         *     and checks again: the credential is still valid, the rights for
+         *     `kind` still hold, and, for a ticket issued to a cookie session, a
+         *     matching `Origin` is present.
+         *
+         *     **Frames.** Binary frames carry raw terminal bytes in both
+         *     directions. Text frames carry JSON control messages:
+         *     `{"type":"state","state":"connecting|open|closed","reason":"..."}` from
+         *     the server, and `{"type":"resize","cols":80,"rows":24}` from the
+         *     client (ignored for SOL).
+         *
+         *     **Close codes.** `4401`: bad, used or expired ticket, or Origin
+         *     refused. `4403`: credential ended, user locked, or rights lost.
+         *     `4409`: device not reachable, or busy. `1011`: server error.
+         *
+         *     The server opens the stream through MeshCentral's own relay (AMT
+         *     redirection for SOL), so AMT credentials never leave the server. A
+         *     device has at most one SOL session at a time.
          */
         post: operations["createConsoleTicket"];
         delete?: never;
@@ -374,11 +466,12 @@ export interface paths {
         };
         /**
          * Event and audit log (newest first)
-         * @description Returns the events the caller may see: events about groups and
-         *     devices the caller has rights on, plus the caller's own user events.
-         *     `LIMITEVENTS` narrows a group to the caller's own events, as in
-         *     MeshCentral. Callers with the site right `ALLEVENTS` see every event
-         *     in the domain.
+         * @description The events the caller may see: events about groups and devices the
+         *     caller has rights on, plus the caller's own user events.
+         *     `LIMITEVENTS` narrows a group to the caller's own events. With
+         *     `ALLEVENTS` or full site rights the caller sees the whole domain,
+         *     except through a group-restricted token (see Authorization). The
+         *     Privacy rules decide `message`, `user`, `token_name` and `source_ip`.
          */
         get: operations["listEvents"];
         put?: never;
@@ -399,27 +492,47 @@ export interface paths {
         /**
          * Live updates (Server-Sent Events)
          * @description A `text/event-stream` response. Browsers use `EventSource` with the
-         *     session cookie. Machine clients send `Authorization: Bearer`. Each
-         *     message has `event:` set to one of the types below, `id:` set to a
-         *     stream sequence number, and `data:` set to a JSON `StreamEvent`. The
-         *     server sends a `: ping` comment every 25 seconds.
+         *     session cookie. Machine clients send `Authorization: Bearer`. A
+         *     credential in the URL (`token`, `access_token` or similar) is
+         *     rejected with `400 invalid_request`, and redacted from logs.
          *
-         *     Event types:
-         *     * `ready`: the first message. Data `{"type":"ready","data":{"server_time":...}}`.
-         *     * `device.updated`: a device's fields changed (name, OS, IPs,
-         *       connectivity, AMT). Data is the full `Device`.
-         *     * `device.power`: the power state changed. Data `{id, power}`.
-         *     * `device.removed`: the device was deleted or is no longer visible.
-         *       Data `{id}`.
-         *     * `event.created`: a new log event the caller may see. Data is an `Event`.
+         *     **Wire format.** The server first sends `retry: 5000`. Each message
+         *     then has:
+         *     * `event:` the type;
+         *     * `id:` a sequence number;
+         *     * `data:` one line of JSON, which is the **envelope**
+         *       `{"type": ..., "data": ...}` (schema `StreamMessage`). Its `type`
+         *       equals the `event:` field.
+         *     A `: ping` comment arrives every 25 seconds.
          *
-         *     Each event passes the same visibility checks as the REST endpoints,
-         *     at the moment it is sent. `Last-Event-ID` resume works on a best-effort
-         *     basis for the last 5 minutes. On a gap the server sends `resync`, and
-         *     the client should refetch `/api/v1/devices`. The server closes the
-         *     stream when the credential ends (logout, expiry, revocation).
+         *     **Types:** `ready`, `device.updated`, `device.power`,
+         *     `device.removed`, `event.created`, `resync` and `closed`. Each has its
+         *     own schema; see `StreamMessage`. Clients MUST ignore stream messages
+         *     whose `type` they don't recognise. New types may be added within v1.
+         *     The set of types is open (`StreamMessageType` is an
+         *     `x-extensible-enum`), and `StreamOther` stands for any type that is
+         *     not listed. Generated clients must not treat the listed types as
+         *     exhaustive.
+         *
+         *     **Recommended subscription.** Integrations that track device state
+         *     should subscribe with
+         *     `types=device.power,device.updated,device.removed,resync,closed`.
+         *     `ready` is always sent; `types` filters only the other messages.
+         *
+         *     **Visibility.** Every message passes the same rules as the REST
+         *     endpoints, using the caller's rights at the moment it is sent. That
+         *     includes the group restriction and the Privacy rules. Messages
+         *     delivered again after a reconnect are checked the same way.
+         *
+         *     **Resume.** Works for the last 5 minutes, using the `Last-Event-ID`
+         *     header or the `last_event_id` query parameter (for clients that
+         *     reconnect by hand). The header wins when both are sent. If the gap
+         *     cannot be filled, the server sends `resync`.
+         *
+         *     **End.** The stream ends with `closed` (see Live updates). A
+         *     credential may hold 5 concurrent streams at most.
          */
-        get: operations["stream"];
+        get: operations["streamEvents"];
         put?: never;
         post?: never;
         delete?: never;
@@ -433,90 +546,97 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
-         * @description Last segment of a MeshCentral id (base64 using `@` and `$`).
-         * @example Hz3$g7aJr0hYpmQ2kV5b@Xq1sTn9cWfE8uLdPoZiRyM4xNvBjKe6tAlGw2HsDcF7
+         * @description Last segment of a MeshCentral device or group id.
+         * @example EXAMPLEnodeId00000000000000000000000000000000000000000000000000
          */
         Id: string;
-        /** @description Pass as `cursor` for the next page; `null` on the last page. */
+        /**
+         * @description Last segment of a MeshCentral user id, or, where the Privacy rules apply, an opaque pseudonym starting with `u_`.
+         * @example alice
+         */
+        UserId: string;
+        /** @description Pass as `cursor` for the next page. `null` on the last page. */
         NextCursor: string | null;
+        ErrorCode: string;
+        ErrorBody: {
+            code: components["schemas"]["ErrorCode"];
+            message: string;
+            /** @description Extra context, such as `field`, `required_scope`, `path` or `reason`. Never the value of a `writeOnly` field. */
+            details?: {
+                [key: string]: unknown;
+            };
+            /** @description Same as the `Outband-Request-Id` header. */
+            request_id?: string;
+        };
         /**
          * @example {
          *       "error": {
          *         "code": "not_found",
          *         "message": "Device not found",
-         *         "request_id": "01HF7Z3K9Q"
+         *         "request_id": "req_EXAMPLE01"
          *       }
          *     }
          */
         Error: {
-            error: {
-                /**
-                 * @description Stable machine-readable code.
-                 * @enum {string}
-                 */
-                code: "invalid_request" | "unauthenticated" | "invalid_credentials" | "invalid_token" | "no_pending_login" | "token_expired" | "token_revoked" | "token_limit" | "csrf_failed" | "insufficient_scope" | "forbidden" | "not_found" | "not_reachable" | "not_supported" | "rate_limited" | "locked_out" | "internal";
-                message: string;
-                /** @description Extra context, such as `{"field":"action"}` or `{"required_scope":"power"}`. */
-                details?: {
-                    [key: string]: unknown;
-                };
-                /** @description Matches the `Outband-Request-Id` response header and the server log. */
-                request_id?: string;
-            };
+            error: components["schemas"]["ErrorBody"];
         };
         Health: {
-            /** @enum {string} */
-            status: "ok" | "starting" | "degraded";
+            status: string;
+        };
+        /** @description `otp` is an authenticator app (TOTP). */
+        TwoFactorMethod: string;
+        TwoFactorFeatures: {
+            /** @description Two-factor login is offered by this server's configuration. */
+            available: boolean;
+            /** @description The domain exempts some client addresses from the second factor. */
+            ip_exemptions: boolean;
+            methods: components["schemas"]["TwoFactorMethod"][];
+        };
+        ServerFeatures: {
+            amt: boolean;
+            twofa: components["schemas"]["TwoFactorFeatures"];
+            /** @description Bearer authentication is on (false while the kill switch is set). */
+            api_tokens: boolean;
+            console_kinds: components["schemas"]["ConsoleKind"][];
+            legacy_ui: boolean;
         };
         ServerInfo: {
-            /** @description Domain title or server name. */
             name: string;
-            /** @description MeshCentral core version, such as `1.3.1`. */
+            /** @description MeshCentral core version. */
             version: string;
             outband_version: string;
-            /** @example 1.0.0-draft.1 */
             api_version: string;
-            features: {
-                /** @description Intel AMT management is enabled. */
-                amt: boolean;
-                /** @description 2FA is available in this domain. */
-                twofa: boolean;
-                api_tokens: boolean;
-                console_kinds: components["schemas"]["ConsoleKind"][];
-                /** @description `/legacy` is served. */
-                legacy_ui: boolean;
-            };
+            features: components["schemas"]["ServerFeatures"];
         };
         User: {
-            /** @description MeshCentral user id (`user/<domain>/<name>`). */
-            id: string;
+            id: components["schemas"]["UserId"];
             name: string;
+            /** @description Left out for tokens without `identity`. */
             email?: string | null;
-            /** @description MeshCentral `SITERIGHT_*` bitmask (`4294967295` = full admin). */
-            siteadmin: number;
+            /** @description MeshCentral site-rights bitmask (4294967295 = full). Left out for tokens without `identity`. */
+            siteadmin?: number;
+        };
+        Scope: string;
+        SessionServer: {
+            name: string;
+            /** @description Only when authenticated. */
+            version?: string;
+        };
+        SessionTwoFactor: {
+            /** @description A pending login is waiting for a second factor. It authenticates nothing. */
+            required: boolean;
+            methods?: components["schemas"]["TwoFactorMethod"][];
+            /** Format: date-time */
+            expires_at?: string | null;
         };
         Session: {
             authenticated: boolean;
             user: components["schemas"]["User"] | null;
-            /** @enum {string|null} */
-            auth_method?: "cookie" | "token" | null;
-            scopes?: components["schemas"]["Scope"][];
-            server: {
-                name: string;
-                /** @description Only present when authenticated. */
-                version?: string;
-            };
-            twofa: {
-                /** @description A password was accepted and a second factor is pending. */
-                required: boolean;
-                methods?: components["schemas"]["TwoFactorMethod"][];
-            };
+            auth_method: string | null;
+            scopes: components["schemas"]["Scope"][];
+            server: components["schemas"]["SessionServer"];
+            twofa: components["schemas"]["SessionTwoFactor"];
         };
-        /**
-         * @description `otp` = authenticator app (TOTP).
-         * @enum {string}
-         */
-        TwoFactorMethod: "otp" | "backup" | "email" | "sms" | "messaging" | "yubikey";
         LoginRequest: {
             username: string;
             password: string;
@@ -526,29 +646,34 @@ export interface components {
             authenticated: true;
             user: components["schemas"]["User"];
         };
-        LoginNeeds2fa: {
+        LoginPending: {
             /** @constant */
             authenticated: false;
-            /** @constant */
-            needs2fa: true;
-            methods: components["schemas"]["TwoFactorMethod"][];
+            twofa: components["schemas"]["SessionTwoFactor"];
         };
-        LoginResult: components["schemas"]["LoginSuccess"] | components["schemas"]["LoginNeeds2fa"];
+        LoginResult: components["schemas"]["LoginSuccess"] | components["schemas"]["LoginPending"];
         SecondFactorRequest: {
-            /** @description The code. */
-            token?: string;
-            method?: components["schemas"]["TwoFactorMethod"];
+            code?: string;
+            /** @enum {string} */
+            method?: "otp" | "backup" | "email" | "sms" | "messaging" | "yubikey";
             /** @description Ask the server to send a code (`email`, `sms`, `messaging`). */
             send?: boolean;
         };
-        /** @enum {string} */
-        Scope: "read" | "power" | "console";
+        TokenOwner: {
+            id: components["schemas"]["UserId"];
+            name: string;
+        };
         ApiToken: {
             id: string;
             name: string;
-            /** @description First 8 characters of the secret (e.g. `obt_k3Jx`), to help identify it. */
+            owner: components["schemas"]["TokenOwner"];
+            /** @description First 8 characters of the secret. */
             prefix: string;
             scopes: components["schemas"]["Scope"][];
+            /** @description The group restriction. `null` means every group the owner can see. */
+            groups: components["schemas"]["Id"][] | null;
+            /** @description Allowed client addresses (CIDR). `null` means any. */
+            allowed_ips: string[] | null;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
@@ -558,180 +683,298 @@ export interface components {
             /** Format: date-time */
             revoked_at: string | null;
         };
+        TokenPage: {
+            items: components["schemas"]["ApiToken"][];
+            next_cursor: components["schemas"]["NextCursor"];
+        };
+        /** @description Give exactly one of `scopes` or `profile`. */
         CreateTokenRequest: {
             name: string;
-            scopes: components["schemas"]["Scope"][];
-            /** @default 90 */
+            scopes?: ("read" | "power_on" | "power_off" | "console" | "identity" | "audit")[];
+            /**
+             * @description `device_power` = `read` + `power_on` + `power_off`.
+             * @enum {string}
+             */
+            profile?: "device_power";
+            /**
+             * @description Limits: 365 days (read and identity only), 90 (audit or power), 30 (console).
+             * @default 90
+             */
             expires_in_days: number;
+            /** @description Limit the token to these groups. Required with `console`. */
+            groups?: components["schemas"]["Id"][];
+            /** @description Limit the token to these client addresses (IPv4 or IPv6 CIDR). */
+            allowed_ips?: string[];
         };
         CreatedToken: {
             token: components["schemas"]["ApiToken"];
-            /** @description Shown once. Send it as `Authorization: Bearer <secret>`. */
+            /** @description Shown once. Send as the bearer credential. */
             secret: string;
         };
+        AdminSettings: {
+            bearer: boolean;
+            /** @description `runtime`: stored through this API. `config`: the startup default. */
+            bearer_source: string;
+            /** Format: date-time */
+            updated_at: string | null;
+            /** @description The user id of the administrator who last changed it. */
+            updated_by: string | null;
+        };
+        AdminSettingsUpdate: {
+            bearer?: boolean;
+        };
+        /** @description The caller's effective MeshCentral rights. */
+        Rights: {
+            /** @description MESHRIGHT bitmask (4294967295 = full). */
+            mask: number;
+            /** @description Lower-case names of the bits that are set, or `[admin]` for full rights. */
+            names: string[];
+        };
+        /** @description MeshCentral group type: amt (AMT only), agent, local (no agent), ipkvm. */
+        GroupKind: string;
         Group: {
             id: components["schemas"]["Id"];
             name: string;
             description: string;
-            /**
-             * @description MeshCentral `mtype`: 1 = amt (AMT-only), 2 = agent, 3 = local (no agent), 4 = ipkvm.
-             * @enum {string}
-             */
-            kind: "amt" | "agent" | "local" | "ipkvm";
+            kind: components["schemas"]["GroupKind"];
             rights: components["schemas"]["Rights"];
             device_count: number;
         };
-        /** @description The caller's effective MeshCentral rights on a group or device. */
-        Rights: {
-            /** @description Raw `MESHRIGHT_*` bitmask (`4294967295` = full). */
-            mask: number;
-            /** @description Decoded names of the bits set, lower-case (`remotecontrol`, `wakedevice`, `resetoff`, `noamt`, ...), or `["admin"]` for full rights. */
-            names: string[];
+        GroupPage: {
+            items: components["schemas"]["Group"][];
+            next_cursor: components["schemas"]["NextCursor"];
         };
-        /**
-         * @description `sol` = Intel AMT Serial-over-LAN. `terminal` = agent shell (not yet available).
-         * @enum {string}
-         */
-        ConsoleKind: "sol" | "terminal";
-        /** @enum {string} */
-        PowerAction: "on" | "off" | "reset" | "cycle" | "sleep" | "wake";
-        /**
-         * @description From MeshCentral `pwr`: 1 = on (S0), 2-4 = sleep (S1-S3),
-         *     5 = hibernate (S4), 6 = soft_off (S5), 7 = present (seen, state not
-         *     known), 8 = off, 0 or missing = unknown.
-         * @enum {string}
-         */
-        PowerState: "on" | "sleep" | "hibernate" | "soft_off" | "off" | "present" | "unknown";
+        GroupRef: {
+            id: components["schemas"]["Id"];
+            name: string;
+        };
+        /** @description `sol`: Intel AMT Serial-over-LAN. `terminal`: agent shell (not yet available). Text consoles only. */
+        ConsoleKind: string;
+        PowerAction: string;
+        PowerPath: string;
+        /** @description From MeshCentral power state: 1 on, 2-4 sleep, 5 hibernate, 6 soft_off, 7 present (seen, state unknown), 8 off, 0 unknown. */
+        PowerState: string;
+        DeviceConnectivity: {
+            agent: boolean;
+            amt_cira: boolean;
+            amt_local: boolean;
+            relay: boolean;
+            mqtt: boolean;
+        };
+        DeviceAmt: {
+            /** @description `none`: no Intel AMT detected. */
+            state: string;
+            version: string | null;
+            /** @description The server can reach AMT now. */
+            reachable: boolean;
+        };
+        DevicePower: {
+            state: components["schemas"]["PowerState"];
+            /** Format: date-time */
+            since: string | null;
+        };
+        /** @description What the caller can do now, given scope, rights and reachability. */
+        DeviceCapabilities: {
+            /** @description Actions available with their default path. */
+            power: components["schemas"]["PowerAction"][];
+            /** @description Each available action's default path, for example `agent` (graceful) or `amt` (hard). */
+            power_via?: {
+                [key: string]: components["schemas"]["PowerPath"];
+            };
+            /** @description Every path each action can take now, for use with `via`. The first entry is the default. */
+            power_paths?: {
+                [key: string]: components["schemas"]["PowerPath"][];
+            };
+            console: components["schemas"]["ConsoleKind"][];
+        };
         Device: {
             id: components["schemas"]["Id"];
             name: string;
-            /** @description Host name or address MeshCentral uses for the device. */
-            host?: string | null;
-            group: {
-                id: components["schemas"]["Id"];
-                name: string;
-            };
-            /** @description OS description as the agent reports it. */
+            host: string | null;
+            group: components["schemas"]["GroupRef"];
             os: string | null;
-            /** @description IP addresses the agent or AMT reported. */
-            ips: string[];
-            /** @description The MeshAgent is connected. */
+            /** @description Left out for tokens without `console` (see Privacy). */
+            ips?: string[];
+            /** @description The agent is connected. */
             online: boolean;
-            /** @description MeshCentral `conn` bits: 1 agent, 2 AMT CIRA, 4 AMT local, 8 relay, 16 MQTT. */
-            connectivity: {
-                agent: boolean;
-                amt_cira: boolean;
-                amt_local: boolean;
-                relay: boolean;
-                mqtt: boolean;
-            };
-            amt: {
-                /**
-                 * @description From `intelamt.state` (0 = unprovisioned, 1 = provisioning, 2 = provisioned); `none` = no Intel AMT detected.
-                 * @enum {string}
-                 */
-                state: "none" | "unprovisioned" | "provisioning" | "provisioned" | "unknown";
-                /** @example 16.1.25 */
-                version: string | null;
-                /** @description The server can reach AMT now (CIRA or local). */
-                reachable: boolean;
-            };
-            power: {
-                state: components["schemas"]["PowerState"];
-                /**
-                 * Format: date-time
-                 * @description When this state was last seen to start.
-                 */
-                since: string | null;
-            };
-            /**
-             * Format: date-time
-             * @description Last agent or AMT connection time; the current time while connected.
-             */
+            connectivity: components["schemas"]["DeviceConnectivity"];
+            amt: components["schemas"]["DeviceAmt"];
+            power: components["schemas"]["DevicePower"];
+            /** Format: date-time */
             last_seen: string | null;
-            /** @description What the caller can do now, given rights, scope and reachability. */
-            capabilities: {
-                power: components["schemas"]["PowerAction"][];
-                console: components["schemas"]["ConsoleKind"][];
-            };
+            capabilities: components["schemas"]["DeviceCapabilities"];
+        };
+        DevicePage: {
+            items: components["schemas"]["Device"][];
+            next_cursor: components["schemas"]["NextCursor"];
+        };
+        AgentInfo: {
+            version: string | null;
+            type: number | null;
+            /** Format: date-time */
+            connected_at: string | null;
+        };
+        HardwareSummary: {
+            manufacturer: string | null;
+            model: string | null;
+            /** @description Left out for tokens without `console` (see Privacy). */
+            serial?: string | null;
+            cpu: string | null;
+            memory_mb: number | null;
         };
         DeviceDetail: components["schemas"]["Device"] & {
             rights: components["schemas"]["Rights"];
-            description?: string | null;
-            tags?: string[];
-            agent?: {
-                version?: string | null;
-                /** @description MeshCentral agent type id. */
-                type?: number | null;
-                /** Format: date-time */
-                connected_at?: string | null;
-            } | null;
-            /** @description Summary from MeshCentral's hardware inventory, when reported. */
-            hardware?: {
-                manufacturer?: string | null;
-                model?: string | null;
-                serial?: string | null;
-                cpu?: string | null;
-                memory_mb?: number | null;
-            } | null;
+            description: string | null;
+            tags: string[];
+            agent: components["schemas"]["AgentInfo"] | null;
+            hardware: components["schemas"]["HardwareSummary"] | null;
         };
         PowerRequest: {
-            action: components["schemas"]["PowerAction"];
+            /** @enum {string} */
+            action: "on" | "off" | "reset" | "cycle" | "sleep" | "wake";
+            /**
+             * @description Use only this path, with no fallback. `403` with `details.path` if the right for it is missing; `409` if it cannot carry the action now.
+             * @enum {string}
+             */
+            via?: "agent" | "amt" | "wol" | "mqtt" | "ipkvm";
         };
         PowerResult: {
+            /** @description Also recorded in the audit event. */
+            action_id: string;
             device_id: components["schemas"]["Id"];
             action: components["schemas"]["PowerAction"];
-            /** @description Paths the command went out on. */
-            via: ("agent" | "amt" | "wol" | "mqtt" | "ipkvm")[];
-            /** @enum {string} */
-            status: "dispatched";
-            /** @description The audit event written for this action. */
-            event_id?: string | null;
+            /** @description The paths the command went out on. */
+            paths: components["schemas"]["PowerPath"][];
+            status: string;
         };
         ConsoleTicket: {
-            /** @description Single use. Do not log it. */
-            ticket: string;
-            /** @description Relative WebSocket URL with the ticket, e.g. `/api/v1/devices/{id}/console/sol?ticket=...`. */
+            /** @description The relative WebSocket path. It does not contain the ticket. */
             url: string;
+            /** @description The WebSocket subprotocols to request, in order: `outband.console.v1` and `outband.ticket.<ticket>`. A secret; do not log it. */
+            protocols: string[];
             /** Format: date-time */
             expires_at: string;
+        };
+        EventActor: {
+            id: components["schemas"]["UserId"];
+            name: string | null;
+            /** @description True when `id` is a pseudonym (see Privacy). */
+            redacted: boolean;
         };
         Event: {
             id: string;
             /** Format: date-time */
             time: string;
-            /** @description MeshCentral `etype` (`node`, `mesh`, `user`, `server`, ...). */
+            /** @description Event type, such as `node`, `mesh`, `user` or `server`. */
             type: string;
-            /** @description MeshCentral event action, such as `poweraction`, `login`, `outband.token.create`. */
+            /** @description Event kind, such as `login`, `outband.power` or `outband.token.create`. */
             action: string;
-            /** @description The event's human-readable message. */
+            /** @description Built from an allowlisted template (see Privacy). */
             message: string;
-            user?: {
-                id?: string;
-                name?: string;
-            } | null;
-            /** @description Set when an API token caused the event. */
-            token_name?: string | null;
-            device_id?: components["schemas"]["Id"] | null;
-            group_id?: components["schemas"]["Id"] | null;
-            /** @description Shown only to site admins. */
+            user: components["schemas"]["EventActor"] | null;
+            /** @description A token id, or a `t_` pseudonym. */
+            token_id: string | null;
+            token_name: string | null;
+            device_id: components["schemas"]["Id"] | null;
+            group_id: components["schemas"]["Id"] | null;
+            action_id?: string | null;
+            outcome?: string;
+            /** @description Only for callers allowed to see it (see Privacy). */
             source_ip?: string | null;
         };
         EventPage: {
             items: components["schemas"]["Event"][];
             next_cursor: components["schemas"]["NextCursor"];
         };
-        StreamEvent: {
-            /** @enum {string} */
-            type: "ready" | "device.updated" | "device.power" | "device.removed" | "event.created" | "resync";
-            /** @description Depends on `type` (see `/api/v1/stream`). */
-            data: components["schemas"]["Device"] | components["schemas"]["Event"] | {
-                [key: string]: unknown;
+        StreamReady: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "ready";
+            data: {
+                /** Format: date-time */
+                server_time: string;
             };
         };
+        DeviceUpdated: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "device.updated";
+            data: components["schemas"]["Device"];
+        };
+        DevicePowerChanged: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "device.power";
+            data: {
+                id: components["schemas"]["Id"];
+                power: components["schemas"]["DevicePower"];
+            };
+        };
+        DeviceRemoved: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "device.removed";
+            /** @description The device was deleted or is no longer visible. */
+            data: {
+                id: components["schemas"]["Id"];
+            };
+        };
+        EventCreated: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "event.created";
+            data: components["schemas"]["Event"];
+        };
+        StreamResync: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "resync";
+            /** @description Empty. Refetch `/api/v1/devices`. */
+            data: Record<string, never>;
+        };
+        StreamClosed: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "closed";
+            data: {
+                /** @description `disabled`: bearer authentication was turned off. */
+                reason: string;
+            };
+        };
+        /** @description Stream message type. Open set; new types may be added within v1, and clients MUST ignore types they don't recognise. */
+        StreamMessageType: string;
+        /** @description A message of a type not listed in this version. Clients MUST ignore it. */
+        StreamOther: {
+            type: components["schemas"]["StreamMessageType"];
+            data: unknown;
+        };
+        /**
+         * @description The JSON on each `data:` line. `type` equals the SSE `event:` field.
+         *     The set of types is open (see `StreamMessageType`). A message is
+         *     either one of the types defined in this version
+         *     (`StreamKnownMessage`), or a `StreamOther`, which clients MUST
+         *     ignore. Generated clients must not be exhaustive over the types.
+         */
+        StreamMessage: components["schemas"]["StreamKnownMessage"] | components["schemas"]["StreamOther"];
+        /** @description The message types defined in this version, by `type`. Not exhaustive within v1. */
+        StreamKnownMessage: components["schemas"]["StreamReady"] | components["schemas"]["DeviceUpdated"] | components["schemas"]["DevicePowerChanged"] | components["schemas"]["DeviceRemoved"] | components["schemas"]["EventCreated"] | components["schemas"]["StreamResync"] | components["schemas"]["StreamClosed"];
     };
     responses: {
-        /** @description Malformed request (`invalid_request`). `details` names the bad fields. */
+        /** @description Malformed request (`invalid_request`). `details.field` names the bad field. */
         BadRequest: {
             headers: {
                 [name: string]: unknown;
@@ -740,7 +983,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description No valid credential (`unauthenticated`), or an expired/revoked token (`token_expired`, `token_revoked`). */
+        /** @description No valid credential (`unauthenticated`), an expired or revoked token (`token_expired`, `token_revoked`), or step-up needed (`reauth_required`). */
         Unauthorized: {
             headers: {
                 "WWW-Authenticate"?: string;
@@ -750,8 +993,8 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description Missing `X-Outband` header or bad Origin (`csrf_failed`), missing scope (`insufficient_scope`), or missing MeshCentral right (`forbidden`). */
-        CsrfOrForbidden: {
+        /** @description Failed CSRF or Origin check, or an `OPTIONS` request (`csrf_failed`); missing scope (`insufficient_scope`); missing right, wrong credential type, or not an administrator (`forbidden`); address not allowed for the token (`ip_not_allowed`); bearer without TLS (`https_required`). */
+        Forbidden: {
             headers: {
                 [name: string]: unknown;
             };
@@ -759,7 +1002,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description No such resource, or the caller cannot see it (`not_found`). */
+        /** @description No such resource, or not visible to the caller (`not_found`). */
         NotFound: {
             headers: {
                 [name: string]: unknown;
@@ -768,10 +1011,46 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description Too many requests (`rate_limited`) or a locked-out login (`locked_out`). */
+        /** @description The `Host` header is not a configured name (`invalid_host`). */
+        InvalidHost: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description The body is not `application/json` (`unsupported_media_type`). */
+        UnsupportedMediaType: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Over a rate limit, or an IP ban (`rate_limited`). */
         RateLimited: {
             headers: {
-                "Retry-After"?: number;
+                "Retry-After": components["headers"]["Retry-After"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description The API is not available in the current server configuration (`unavailable`). See Availability. */
+        ServiceUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Any other error, such as `500 internal`. */
+        DefaultError: {
+            headers: {
                 [name: string]: unknown;
             };
             content: {
@@ -780,11 +1059,12 @@ export interface components {
         };
     };
     parameters: {
-        /** @description CSRF guard. Required for cookie-authenticated requests that are not GET/HEAD. */
+        /** @description CSRF guard. Required for cookie-authenticated requests that are not GET or HEAD. */
         XOutband: "1";
         DeviceId: components["schemas"]["Id"];
         GroupId: components["schemas"]["Id"];
-        ConsoleKind: components["schemas"]["ConsoleKind"];
+        TokenId: string;
+        ConsoleKind: "sol" | "terminal";
         Limit: number;
         Cursor: string;
         /** @description Only events at or after this time. */
@@ -793,7 +1073,16 @@ export interface components {
         Until: string;
     };
     requestBodies: never;
-    headers: never;
+    headers: {
+        /** @description Requests allowed in the current window. */
+        "RateLimit-Limit": number;
+        /** @description Requests left in the current window. */
+        "RateLimit-Remaining": number;
+        /** @description Seconds until the window resets. */
+        "RateLimit-Reset": number;
+        /** @description Seconds to wait before retrying. */
+        "Retry-After": number;
+    };
     pathItems: never;
 }
 export type $defs = Record<string, never>;
@@ -807,25 +1096,36 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Server is up and the database answers. */
+            /** @description Up (`ok` or `degraded`). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
+                    /**
+                     * @example {
+                     *       "status": "ok"
+                     *     }
+                     */
                     "application/json": components["schemas"]["Health"];
                 };
             };
             429: components["responses"]["RateLimited"];
-            /** @description Server is starting, or the database cannot be reached. */
+            /** @description Starting, or the database cannot be reached. */
             503: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
+                    /**
+                     * @example {
+                     *       "status": "starting"
+                     *     }
+                     */
                     "application/json": components["schemas"]["Health"];
                 };
             };
+            default: components["responses"]["DefaultError"];
         };
     };
     getServer: {
@@ -840,13 +1140,43 @@ export interface operations {
             /** @description OK */
             200: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
+                    /**
+                     * @example {
+                     *       "name": "Outband",
+                     *       "version": "1.3.1",
+                     *       "outband_version": "0.1.0",
+                     *       "api_version": "1.0.0-draft.5",
+                     *       "features": {
+                     *         "amt": true,
+                     *         "twofa": {
+                     *           "available": true,
+                     *           "ip_exemptions": false,
+                     *           "methods": [
+                     *             "otp",
+                     *             "email"
+                     *           ]
+                     *         },
+                     *         "api_tokens": true,
+                     *         "console_kinds": [
+                     *           "sol"
+                     *         ],
+                     *         "legacy_ui": true
+                     *       }
+                     *     }
+                     */
                     "application/json": components["schemas"]["ServerInfo"];
                 };
             };
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     getSession: {
@@ -868,13 +1198,15 @@ export interface operations {
                 };
             };
             429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     login: {
         parameters: {
             query?: never;
             header?: {
-                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET/HEAD. */
+                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET or HEAD. */
                 "X-Outband"?: components["parameters"]["XOutband"];
             };
             path?: never;
@@ -882,17 +1214,20 @@ export interface operations {
         };
         requestBody: {
             content: {
+                /**
+                 * @example {
+                 *       "username": "alice",
+                 *       "password": "correct-horse-battery-staple"
+                 *     }
+                 */
                 "application/json": components["schemas"]["LoginRequest"];
             };
         };
         responses: {
-            /**
-             * @description Either logged in (`authenticated: true`), or a second factor is
-             *     required (`authenticated: false, needs2fa: true`).
-             */
+            /** @description Logged in, or a second factor is required. */
             200: {
                 headers: {
-                    /** @description MeshCentral session cookie (`xid`, `xid.sig`). */
+                    /** @description MeshCentral session cookie. */
                     "Set-Cookie"?: string;
                     [name: string]: unknown;
                 };
@@ -901,24 +1236,36 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
-            /** @description Wrong username or password (code `invalid_credentials`). The message never says which one was wrong. */
+            /** @description Refused (`invalid_credentials`). The body is the same for every reason. */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "invalid_credentials",
+                     *         "message": "Invalid username or password"
+                     *       }
+                     *     }
+                     */
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            403: components["responses"]["CsrfOrForbidden"];
+            403: components["responses"]["Forbidden"];
+            415: components["responses"]["UnsupportedMediaType"];
+            421: components["responses"]["InvalidHost"];
             429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     loginSecondFactor: {
         parameters: {
             query?: never;
             header?: {
-                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET/HEAD. */
+                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET or HEAD. */
                 "X-Outband"?: components["parameters"]["XOutband"];
             };
             path?: never;
@@ -926,6 +1273,12 @@ export interface operations {
         };
         requestBody: {
             content: {
+                /**
+                 * @example {
+                 *       "code": "123456",
+                 *       "method": "otp"
+                 *     }
+                 */
                 "application/json": components["schemas"]["SecondFactorRequest"];
             };
         };
@@ -939,7 +1292,7 @@ export interface operations {
                     "application/json": components["schemas"]["LoginSuccess"];
                 };
             };
-            /** @description Code sent through the requested method. */
+            /** @description A code was sent through the requested method. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -947,7 +1300,7 @@ export interface operations {
                 content?: never;
             };
             400: components["responses"]["BadRequest"];
-            /** @description Wrong code (`invalid_token`) or no pending login (`no_pending_login`). */
+            /** @description Wrong code (`invalid_code`), or no pending login, or it expired or reached its limit (`no_pending_login`). */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -956,15 +1309,19 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            403: components["responses"]["CsrfOrForbidden"];
+            403: components["responses"]["Forbidden"];
+            415: components["responses"]["UnsupportedMediaType"];
+            421: components["responses"]["InvalidHost"];
             429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     logout: {
         parameters: {
             query?: never;
             header?: {
-                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET/HEAD. */
+                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET or HEAD. */
                 "X-Outband"?: components["parameters"]["XOutband"];
             };
             path?: never;
@@ -979,12 +1336,19 @@ export interface operations {
                 };
                 content?: never;
             };
-            403: components["responses"]["CsrfOrForbidden"];
+            403: components["responses"]["Forbidden"];
+            421: components["responses"]["InvalidHost"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     listTokens: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: components["parameters"]["Limit"];
+                cursor?: components["parameters"]["Cursor"];
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -994,22 +1358,28 @@ export interface operations {
             /** @description OK */
             200: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        items: components["schemas"]["ApiToken"][];
-                    };
+                    "application/json": components["schemas"]["TokenPage"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     createToken: {
         parameters: {
             query?: never;
             header?: {
-                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET/HEAD. */
+                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET or HEAD. */
                 "X-Outband"?: components["parameters"]["XOutband"];
             };
             path?: never;
@@ -1021,18 +1391,48 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Created. Store the secret now; it cannot be retrieved again. */
+            /** @description Created. Store the secret now; it cannot be shown again. */
             201: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
+                    /**
+                     * @example {
+                     *       "token": {
+                     *         "id": "tok_EXAMPLE01",
+                     *         "name": "home-automation",
+                     *         "owner": {
+                     *           "id": "alice",
+                     *           "name": "alice"
+                     *         },
+                     *         "prefix": "obt_EXAM",
+                     *         "scopes": [
+                     *           "read",
+                     *           "power_on",
+                     *           "power_off"
+                     *         ],
+                     *         "groups": null,
+                     *         "allowed_ips": [
+                     *           "192.0.2.0/28"
+                     *         ],
+                     *         "created_at": "2026-01-01T12:00:00Z",
+                     *         "expires_at": "2026-04-01T12:00:00Z",
+                     *         "last_used_at": null,
+                     *         "revoked_at": null
+                     *       },
+                     *       "secret": "obt_EXAMPLEexampleEXAMPLEexampleEXAMPLEexampleE"
+                     *     }
+                     */
                     "application/json": components["schemas"]["CreatedToken"];
                 };
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
-            403: components["responses"]["CsrfOrForbidden"];
+            403: components["responses"]["Forbidden"];
             /** @description Token limit reached (`token_limit`). */
             409: {
                 headers: {
@@ -1042,17 +1442,21 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            415: components["responses"]["UnsupportedMediaType"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     revokeToken: {
         parameters: {
             query?: never;
             header?: {
-                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET/HEAD. */
+                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET or HEAD. */
                 "X-Outband"?: components["parameters"]["XOutband"];
             };
             path: {
-                tokenId: string;
+                tokenId: components["parameters"]["TokenId"];
             };
             cookie?: never;
         };
@@ -1061,16 +1465,91 @@ export interface operations {
             /** @description Revoked. */
             204: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content?: never;
             };
             401: components["responses"]["Unauthorized"];
-            403: components["responses"]["CsrfOrForbidden"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
-    listGroups: {
+    adminListTokens: {
+        parameters: {
+            query?: {
+                /** @description Only this user's tokens. */
+                user?: components["schemas"]["UserId"];
+                /** @description Only tokens whose `prefix` starts with this value. */
+                prefix?: string;
+                include_revoked?: boolean;
+                limit?: components["parameters"]["Limit"];
+                cursor?: components["parameters"]["Cursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
+        };
+    };
+    adminRevokeToken: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET or HEAD. */
+                "X-Outband"?: components["parameters"]["XOutband"];
+            };
+            path: {
+                tokenId: components["parameters"]["TokenId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revoked. */
+            204: {
+                headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
+        };
+    };
+    adminGetSettings: {
         parameters: {
             query?: never;
             header?: never;
@@ -1082,15 +1561,113 @@ export interface operations {
             /** @description OK */
             200: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        items: components["schemas"]["Group"][];
-                    };
+                    "application/json": components["schemas"]["AdminSettings"];
                 };
             };
             401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
+        };
+    };
+    adminPutSettings: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET or HEAD. */
+                "X-Outband"?: components["parameters"]["XOutband"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "bearer": false
+                 *     }
+                 */
+                "application/json": components["schemas"]["AdminSettingsUpdate"];
+            };
+        };
+        responses: {
+            /** @description The settings now in effect. */
+            200: {
+                headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminSettings"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            415: components["responses"]["UnsupportedMediaType"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
+        };
+    };
+    listGroups: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["Limit"];
+                cursor?: components["parameters"]["Cursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK, sorted by name. */
+            200: {
+                headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "items": [
+                     *         {
+                     *           "id": "EXAMPLEgroupId0000000000000000000000000000000000000000000000000",
+                     *           "name": "Lab",
+                     *           "description": "",
+                     *           "kind": "agent",
+                     *           "rights": {
+                     *             "mask": 4294967295,
+                     *             "names": [
+                     *               "admin"
+                     *             ]
+                     *           },
+                     *           "device_count": 3
+                     *         }
+                     *       ],
+                     *       "next_cursor": null
+                     *     }
+                     */
+                    "application/json": components["schemas"]["GroupPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     getGroup: {
@@ -1107,6 +1684,9 @@ export interface operations {
             /** @description OK */
             200: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1115,6 +1695,9 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     listDevices: {
@@ -1122,13 +1705,9 @@ export interface operations {
             query?: {
                 /** @description Only devices in this group. */
                 group?: components["schemas"]["Id"];
-                /**
-                 * @description `online` = the agent is connected; `offline` = no agent connection
-                 *     (the device may still be reachable over AMT); `amt` = Intel AMT is
-                 *     reachable (CIRA or local).
-                 */
+                /** @description `online`: the agent is connected. `offline`: no agent connection. `amt`: Intel AMT is reachable. */
                 status?: "online" | "offline" | "amt";
-                /** @description Case-insensitive substring match on name or host name. */
+                /** @description Case-insensitive substring match on the name or host name. */
                 q?: string;
                 limit?: components["parameters"]["Limit"];
                 cursor?: components["parameters"]["Cursor"];
@@ -1142,17 +1721,92 @@ export interface operations {
             /** @description OK, sorted by name. */
             200: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        items: components["schemas"]["Device"][];
-                        next_cursor: components["schemas"]["NextCursor"];
-                    };
+                    /**
+                     * @example {
+                     *       "items": [
+                     *         {
+                     *           "id": "EXAMPLEnodeId00000000000000000000000000000000000000000000000000",
+                     *           "name": "server-01",
+                     *           "host": "server-01.example.com",
+                     *           "group": {
+                     *             "id": "EXAMPLEgroupId0000000000000000000000000000000000000000000000000",
+                     *             "name": "Lab"
+                     *           },
+                     *           "os": "Ubuntu 24.04 LTS",
+                     *           "ips": [
+                     *             "192.0.2.10",
+                     *             "2001:db8::10"
+                     *           ],
+                     *           "online": true,
+                     *           "connectivity": {
+                     *             "agent": true,
+                     *             "amt_cira": false,
+                     *             "amt_local": true,
+                     *             "relay": false,
+                     *             "mqtt": false
+                     *           },
+                     *           "amt": {
+                     *             "state": "provisioned",
+                     *             "version": "16.1.25",
+                     *             "reachable": true
+                     *           },
+                     *           "power": {
+                     *             "state": "on",
+                     *             "since": "2026-01-01T08:00:00Z"
+                     *           },
+                     *           "last_seen": "2026-01-01T12:00:00Z",
+                     *           "capabilities": {
+                     *             "power": [
+                     *               "off",
+                     *               "reset",
+                     *               "sleep",
+                     *               "cycle"
+                     *             ],
+                     *             "power_via": {
+                     *               "off": "agent",
+                     *               "reset": "agent",
+                     *               "sleep": "agent",
+                     *               "cycle": "amt"
+                     *             },
+                     *             "power_paths": {
+                     *               "off": [
+                     *                 "agent",
+                     *                 "amt"
+                     *               ],
+                     *               "reset": [
+                     *                 "agent",
+                     *                 "amt"
+                     *               ],
+                     *               "sleep": [
+                     *                 "agent"
+                     *               ],
+                     *               "cycle": [
+                     *                 "amt"
+                     *               ]
+                     *             },
+                     *             "console": [
+                     *               "sol"
+                     *             ]
+                     *           }
+                     *         }
+                     *       ],
+                     *       "next_cursor": null
+                     *     }
+                     */
+                    "application/json": components["schemas"]["DevicePage"];
                 };
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     getDevice: {
@@ -1169,6 +1823,9 @@ export interface operations {
             /** @description OK */
             200: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1177,14 +1834,18 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     powerAction: {
         parameters: {
             query?: never;
             header?: {
-                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET/HEAD. */
+                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET or HEAD. */
                 "X-Outband"?: components["parameters"]["XOutband"];
+                "Idempotency-Key"?: string;
             };
             path: {
                 deviceId: components["parameters"]["DeviceId"];
@@ -1200,21 +1861,50 @@ export interface operations {
             /** @description Dispatched. */
             202: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
+                    /**
+                     * @example {
+                     *       "action_id": "act_EXAMPLE01",
+                     *       "device_id": "EXAMPLEnodeId00000000000000000000000000000000000000000000000000",
+                     *       "action": "off",
+                     *       "paths": [
+                     *         "agent"
+                     *       ],
+                     *       "status": "dispatched"
+                     *     }
+                     */
                     "application/json": components["schemas"]["PowerResult"];
                 };
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
-            403: components["responses"]["CsrfOrForbidden"];
+            /** @description `csrf_failed`, `insufficient_scope`, or `forbidden`. For a missing right on the requested `via` path, `details.path` names the path. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "forbidden",
+                     *         "message": "Not allowed on this path",
+                     *         "details": {
+                     *           "path": "amt"
+                     *         }
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             404: components["responses"]["NotFound"];
-            /**
-             * @description No path can carry this action right now (`not_reachable`), for
-             *     example `sleep` while the agent is offline, or `on` while AMT is
-             *     not reachable.
-             */
+            /** @description No path can carry the action now, or the requested `via` path cannot (`not_reachable`); or `idempotency_conflict`. Nothing was dispatched. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -1223,7 +1913,10 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            415: components["responses"]["UnsupportedMediaType"];
             429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     listDeviceEvents: {
@@ -1247,6 +1940,9 @@ export interface operations {
             /** @description OK */
             200: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1256,13 +1952,16 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     createConsoleTicket: {
         parameters: {
             query?: never;
             header?: {
-                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET/HEAD. */
+                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET or HEAD. */
                 "X-Outband"?: components["parameters"]["XOutband"];
             };
             path: {
@@ -1276,16 +1975,29 @@ export interface operations {
             /** @description Ticket created. */
             201: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
+                    /**
+                     * @example {
+                     *       "url": "/api/v1/devices/EXAMPLEnodeId00000000000000000000000000000000000000000000000000/console/sol",
+                     *       "protocols": [
+                     *         "outband.console.v1",
+                     *         "outband.ticket.EXAMPLEticket"
+                     *       ],
+                     *       "expires_at": "2026-01-01T12:01:00Z"
+                     *     }
+                     */
                     "application/json": components["schemas"]["ConsoleTicket"];
                 };
             };
             401: components["responses"]["Unauthorized"];
-            403: components["responses"]["CsrfOrForbidden"];
+            403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
-            /** @description Console kind not available on this device (`not_reachable` or `not_supported`). */
+            /** @description Console kind not available now (`not_reachable`), not supported on this device (`not_supported`), or already in use (`busy`). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -1295,6 +2007,8 @@ export interface operations {
                 };
             };
             429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
     listEvents: {
@@ -1302,9 +2016,9 @@ export interface operations {
             query?: {
                 device?: components["schemas"]["Id"];
                 group?: components["schemas"]["Id"];
-                /** @description MeshCentral event type (`etype`), such as `node`, `mesh`, `user`. */
+                /** @description Event type, such as `node`, `mesh` or `user`. */
                 type?: string;
-                /** @description If true, only events from state-changing API or UI actions (those that have a user). */
+                /** @description Only Outband audit events. */
                 audit?: boolean;
                 /** @description Only events at or after this time. */
                 since?: components["parameters"]["Since"];
@@ -1322,21 +2036,54 @@ export interface operations {
             /** @description OK */
             200: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
+                    /**
+                     * @example {
+                     *       "items": [
+                     *         {
+                     *           "id": "evt_EXAMPLE01",
+                     *           "time": "2026-01-01T12:00:01Z",
+                     *           "type": "node",
+                     *           "action": "outband.power",
+                     *           "message": "Power action \"off\" dispatched through the agent",
+                     *           "user": {
+                     *             "id": "u_3f9a1c2b",
+                     *             "name": null,
+                     *             "redacted": true
+                     *           },
+                     *           "token_id": "t_77d0e4aa",
+                     *           "token_name": null,
+                     *           "device_id": "EXAMPLEnodeId00000000000000000000000000000000000000000000000000",
+                     *           "group_id": "EXAMPLEgroupId0000000000000000000000000000000000000000000000000",
+                     *           "action_id": "act_EXAMPLE01",
+                     *           "outcome": "success"
+                     *         }
+                     *       ],
+                     *       "next_cursor": null
+                     *     }
+                     */
                     "application/json": components["schemas"]["EventPage"];
                 };
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
-    stream: {
+    streamEvents: {
         parameters: {
             query?: {
-                /** @description Comma-separated event types to receive (default all). */
+                /** @description Comma-separated types to receive (default all). Unknown type names are ignored, not rejected. */
                 types?: string;
+                /** @description Same as the `Last-Event-ID` header. It is not a credential. */
+                last_event_id?: string;
             };
             header?: {
                 "Last-Event-ID"?: string;
@@ -1349,14 +2096,27 @@ export interface operations {
             /** @description Event stream. */
             200: {
                 headers: {
+                    "RateLimit-Limit": components["headers"]["RateLimit-Limit"];
+                    "RateLimit-Remaining": components["headers"]["RateLimit-Remaining"];
+                    "RateLimit-Reset": components["headers"]["RateLimit-Reset"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "text/event-stream": components["schemas"]["StreamEvent"];
+                    /**
+                     * @example retry: 5000
+                     *
+                     *     event: device.power
+                     *     id: 42
+                     *     data: {"type":"device.power","data":{"id":"EXAMPLEnodeId00000000000000000000000000000000000000000000000000","power":{"state":"off","since":"2026-01-01T12:00:05Z"}}}
+                     */
+                    "text/event-stream": components["schemas"]["StreamMessage"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
         };
     };
 }

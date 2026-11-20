@@ -44,6 +44,9 @@ export function UserMenu(): JSX.Element {
             ))}
           </div>
           <div class="menu-sep" />
+          <a class="menu-item" role="menuitem" href="/settings/tokens" data-testid="settings-link" onClick={() => setOpen(false)}>
+            <Icon name="terminal" /> API tokens
+          </a>
           <button class="menu-item" role="menuitem" data-testid="logout" onClick={() => void signOut()}>
             <Icon name="logout" /> Sign out
           </button>

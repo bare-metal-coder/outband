@@ -3,13 +3,14 @@ import { match, navigate, path } from './router';
 import { Login } from './routes/Login';
 import { NotFound } from './routes/NotFound';
 import { refreshSession, session, sessionError, markSignedOut } from './state/session';
-import { setUnauthorizedHandler, start, stop } from './state/devices';
+import { setClosedHandler, setUnauthorizedHandler, start, stop } from './state/devices';
 import { Shell } from './ui/Shell';
 import { Toasts } from './ui/Toasts';
 import { Empty } from './ui/Empty';
 
 const Devices = lazy(() => import('./routes/Devices'));
 const Device = lazy(() => import('./routes/Device'));
+const Settings = lazy(() => import('./routes/Settings'));
 
 function Routes(): JSX.Element {
   const device = () => match('/devices/:id/:tab?', path());
@@ -19,6 +20,7 @@ function Routes(): JSX.Element {
         <Match when={path() === '/'}>
           <Devices />
         </Match>
+        <Match when={match('/settings/:section?', path())}>{(p) => <Settings section={p().section} />}</Match>
         <Match when={device()}>{(p) => <Device id={p().id ?? ''} tab={p().tab} />}</Match>
       </Switch>
     </Suspense>
@@ -28,6 +30,7 @@ function Routes(): JSX.Element {
 export function App(): JSX.Element {
   onMount(() => void refreshSession());
   setUnauthorizedHandler(markSignedOut);
+  setClosedHandler(() => void refreshSession());
 
   const authed = () => session()?.authenticated === true;
   createEffect(() => {

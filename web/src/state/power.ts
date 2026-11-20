@@ -1,8 +1,8 @@
-/** One flow for every power action: confirm if destructive, call, toast. */
+/** One flow for every power action: choose a path and confirm if needed, call, toast. */
 import { createSignal } from 'solid-js';
 import { ApiError } from '../api/http';
-import { powerAction } from '../api/v1';
-import type { Device, PowerAction } from '../model/device';
+import { newIdempotencyKey, powerAction } from '../api/v1';
+import { channelName, type Device, type PowerAction, type PowerOption } from '../model/device';
 import { toast } from './toasts';
 
 export interface PendingConfirm {
@@ -11,24 +11,41 @@ export interface PendingConfirm {
 }
 
 const [pending, setPending] = createSignal<PendingConfirm | null>(null);
+/** Index into `pending().action.options`: what the user picked in the dialog. */
+const [choice, setChoice] = createSignal(0);
 const [busy, setBusy] = createSignal<string | null>(null);
-export { pending, busy };
+export { pending, choice, setChoice, busy };
 
-const CHANNEL: Record<PowerAction['channel'], string> = { agent: 'agent', amt: 'Intel AMT', wol: 'Wake-on-LAN' };
-export const channelName = (c: PowerAction['channel']): string => CHANNEL[c];
+/** Plain-language reasons for the spec's power errors. */
+export function powerErrorMessage(err: unknown): string {
+  if (!(err instanceof ApiError)) return err instanceof Error ? err.message : 'Unknown error';
+  const path = typeof err.details?.path === 'string' ? channelName(err.details.path) : null;
+  switch (err.code) {
+    case 'not_reachable':
+      return 'That path cannot carry this action right now. Nothing was sent.';
+    case 'forbidden':
+      return path ? `You do not have the right to do this through ${path}. Nothing was sent.` : 'You do not have the right to do this on this device.';
+    case 'insufficient_scope':
+      return 'Your credential does not allow this power action.';
+    case 'rate_limited':
+      return err.retryAfter ? `Too many power actions. Try again in ${err.retryAfter}s.` : 'Too many power actions. Wait a moment and try again.';
+    case 'not_found':
+      return 'This device no longer exists or you cannot see it.';
+    case 'idempotency_conflict':
+      return 'That request was already sent with different details. Try again.';
+    case 'unauthenticated':
+      return 'Your session ended. Sign in again.';
+    default:
+      return err.message;
+  }
+}
 
-const ERRORS: Record<string, string> = {
-  not_reachable: 'No channel can carry this action right now.',
-  forbidden: 'You do not have the right to do this on this device.',
-  insufficient_scope: 'Your credential does not allow power actions.',
-  rate_limited: 'Too many power actions. Wait a moment and try again.',
-  not_found: 'This device no longer exists or you cannot see it.',
-};
-
-/** Start an action. Destructive ones wait for confirm(). */
+/** Start an action. It waits for confirm() when destructive or when there is a path to choose. */
 export function requestPower(device: Device, action: PowerAction): void {
-  if (action.destructive) setPending({ device, action });
-  else void run(device, action);
+  if (action.destructive || action.options.length > 1) {
+    setChoice(0);
+    setPending({ device, action });
+  } else void run(device, action, action.options[0]!);
 }
 
 export function cancelConfirm(): void {
@@ -38,23 +55,19 @@ export function cancelConfirm(): void {
 export async function confirmPending(): Promise<void> {
   const p = pending();
   if (!p) return;
+  const opt = p.action.options[choice()] ?? p.action.options[0]!;
   setPending(null);
-  await run(p.device, p.action);
+  await run(p.device, p.action, opt);
 }
 
-async function run(device: Device, action: PowerAction): Promise<void> {
+async function run(device: Device, action: PowerAction, opt: PowerOption): Promise<void> {
   setBusy(device.id);
   try {
-    const res = await powerAction(device.id, action.kind);
-    const via = res.via?.length ? res.via.join(' + ') : CHANNEL[action.channel];
-    toast('success', `${action.label} sent to ${device.name}`, `Dispatched via ${via}. The state updates when the device responds.`);
+    const res = await powerAction(device.id, action.kind, { via: action.explicitVia ? opt.via : undefined, key: newIdempotencyKey() });
+    const paths = res.paths.length ? res.paths.map(channelName).join(' + ') : channelName(opt.via);
+    toast('success', `${opt.label} sent to ${device.name}`, `Dispatched via ${paths}. The state updates when the device responds.`);
   } catch (err) {
-    let msg = err instanceof Error ? err.message : 'Unknown error';
-    if (err instanceof ApiError) {
-      const code = (err.body as { error?: { code?: string } } | undefined)?.error?.code;
-      if (code && ERRORS[code]) msg = ERRORS[code];
-    }
-    toast('error', `${action.label} failed on ${device.name}`, msg);
+    toast('error', `${opt.label} failed on ${device.name}`, powerErrorMessage(err));
   } finally {
     setBusy(null);
   }

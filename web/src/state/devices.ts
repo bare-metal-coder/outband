@@ -42,6 +42,11 @@ export function setUnauthorizedHandler(fn: () => void): void {
   onUnauthorized = fn;
 }
 
+let onClosed: () => void = () => {};
+export function setClosedHandler(fn: () => void): void {
+  onClosed = fn;
+}
+
 export async function reload(): Promise<void> {
   try {
     const [g, d] = await Promise.all([listGroups(), listAllDevices()]);
@@ -69,7 +74,10 @@ export function apply(u: LiveUpdate): void {
       upsertDevice(u.device);
       break;
     case 'power':
-      if (state.byId[u.id]) setState('byId', u.id, 'power', u.power);
+      if (state.byId[u.id]) batch(() => {
+        setState('byId', u.id, 'power', u.power);
+        setState('byId', u.id, 'powerSince', u.since);
+      });
       break;
     case 'removed':
       setState('byId', u.id, undefined as unknown as Device);
@@ -79,6 +87,10 @@ export function apply(u: LiveUpdate): void {
       break;
     case 'resync':
       void reload();
+      break;
+    case 'closed':
+      // The server ended the stream (revoked, logout, expired, ...). Find out whether we are still signed in.
+      onClosed();
       break;
     case 'ready':
       break;
@@ -92,11 +104,13 @@ export function start(): void {
   void reload();
   stream = createStream({
     url: streamUrl,
-    events: STREAM_TYPES,
+    events: [...STREAM_TYPES],
     onStatus: setStreamStatus,
+    // The server asks clients to wait 5s before reconnecting (`retry: 5000`).
+    backoff: { baseMs: 5000 },
     onReconnect: () => void reload(),
     onMessage: (m) => {
-      const u = adaptStream(m.type, m.data);
+      const u = adaptStream(m.data);
       if (u) apply(u);
     },
   });

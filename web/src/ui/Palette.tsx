@@ -1,5 +1,5 @@
 import { createMemo, createSignal, For, Show, type JSX } from 'solid-js';
-import { availableActions, matches, type Device, type PowerAction } from '../model/device';
+import { availableActions, channelName, matches, type Device, type PowerAction } from '../model/device';
 import { navigate } from '../router';
 import { devices, groupName } from '../state/devices';
 import { requestPower } from '../state/power';
@@ -30,8 +30,9 @@ export function Palette(): JSX.Element {
     for (const d of devices()) {
       const actions = availableActions(d);
       // "web01 restart": a device term plus an action term.
-      const actionHits = actions.filter((a) => words.some((w) => a.label.toLowerCase().startsWith(w) || a.kind === w));
-      const devTerms = words.filter((w) => !actions.some((a) => a.label.toLowerCase().startsWith(w) || a.kind === w));
+      const hit = (a: PowerAction, w: string) => a.kind === w || [a.label, ...a.options.map((o) => o.label)].some((l) => l.toLowerCase().startsWith(w));
+      const actionHits = actions.filter((a) => words.some((w) => hit(a, w)));
+      const devTerms = words.filter((w) => !actions.some((a) => hit(a, w)));
       if (!matches(d, devTerms.join(' '), groupName(d.groupId))) continue;
       if (actionHits.length && devTerms.length) {
         for (const a of actionHits) out.push({ kind: 'action', id: `${d.id}:${a.kind}`, device: d, action: a });
@@ -120,7 +121,7 @@ export function Palette(): JSX.Element {
                         <>
                           <span>{a().action.label}</span>
                           <span class="muted">{a().device.name}</span>
-                          <span class="hint state">{a().action.channel}</span>
+                          <span class="hint state">{a().action.options.map((o) => channelName(o.via)).join(' / ')}</span>
                         </>
                       )}
                     </Show>

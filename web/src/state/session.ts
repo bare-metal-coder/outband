@@ -28,6 +28,7 @@ export function markSignedOut(): void {
     serverVersion: null,
     pending2fa: false,
     methods: [],
+    scopes: [],
   });
 }
 

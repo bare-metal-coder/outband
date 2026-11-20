@@ -1,33 +1,68 @@
-import { Show, type JSX } from 'solid-js';
-import { cancelConfirm, channelName, confirmPending, pending } from '../state/power';
+import { For, Show, type JSX } from 'solid-js';
+import { channelName } from '../model/device';
+import { cancelConfirm, choice, confirmPending, pending, setChoice } from '../state/power';
 import { Layer } from './Layer';
 
-/** The confirm step for destructive power actions. Names the device and channel. */
+/**
+ * The confirm step for power actions. Names the device and the path. When the
+ * server offers more than one path (graceful agent vs hard Intel AMT) every
+ * choice is listed, the default first and pre-selected.
+ */
 export function ConfirmPower(): JSX.Element {
   let cancelBtn: HTMLButtonElement | undefined;
   return (
     <Show when={pending()}>
-      {(p) => (
-        <Layer onClose={cancelConfirm} label={`Confirm ${p().action.label}`} role="alertdialog" initialFocus={() => cancelBtn}>
-          <div class="dialog" data-testid="confirm-dialog">
-            <h2>
-              {p().action.label} <span class="mono">{p().device.name}</span>?
-            </h2>
-            <p class="muted">{p().action.detail}</p>
-            <p class="muted" style={{ 'margin-top': '10px' }}>
-              Channel: <span class="state">{channelName(p().action.channel)}</span>
-            </p>
-            <div class="actions">
-              <button ref={cancelBtn} class="btn" onClick={cancelConfirm}>
-                Cancel
-              </button>
-              <button class="btn btn-danger" onClick={() => void confirmPending()} data-testid="confirm-power">
-                {p().action.label}
-              </button>
+      {(p) => {
+        const opt = () => p().action.options[choice()] ?? p().action.options[0]!;
+        const many = () => p().action.options.length > 1;
+        return (
+          <Layer onClose={cancelConfirm} label={`Confirm ${opt().label}`} role="alertdialog" initialFocus={() => cancelBtn}>
+            <div class="dialog" data-testid="confirm-dialog">
+              <h2>
+                {many() ? p().action.label : opt().label} <span class="mono">{p().device.name}</span>?
+              </h2>
+              <Show
+                when={many()}
+                fallback={
+                  <>
+                    <p class="muted">{opt().detail}</p>
+                    <p class="muted" style={{ 'margin-top': '10px' }}>
+                      Path: <span class="state">{channelName(opt().via)}</span>
+                    </p>
+                  </>
+                }
+              >
+                <fieldset class="choices" role="radiogroup" aria-label="How to carry it out">
+                  <For each={p().action.options}>
+                    {(o, i) => (
+                      <label class="choice" data-checked={String(choice() === i())}>
+                        <input type="radio" name="power-via" checked={choice() === i()} onChange={() => setChoice(i())} data-testid={`via-${o.via}`} />
+                        <span>
+                          <span class="choice-label">
+                            {o.label}
+                            <Show when={i() === 0}>
+                              <span class="state"> default</span>
+                            </Show>
+                          </span>
+                          <span class="muted choice-detail">{o.detail}</span>
+                        </span>
+                      </label>
+                    )}
+                  </For>
+                </fieldset>
+              </Show>
+              <div class="actions">
+                <button ref={cancelBtn} class="btn" onClick={cancelConfirm}>
+                  Cancel
+                </button>
+                <button class="btn btn-danger" onClick={() => void confirmPending()} data-testid="confirm-power">
+                  {opt().label}
+                </button>
+              </div>
             </div>
-          </div>
-        </Layer>
-      )}
+          </Layer>
+        );
+      }}
     </Show>
   );
 }
