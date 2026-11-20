@@ -86,6 +86,10 @@ API settings go under `settings.outbandApi` in `config.json`:
   tokens are refused on every request), or turn all bearer tokens off at
   once with the kill switch (`PUT /api/v1/admin/settings` with
   `{"bearer": false}`).
+* **Database restores.** Restoring a MeshCentral database backup revokes
+  `/api/v1` sessions and tokens once for every user whose `passchange`
+  differs from the backup. This is intended: Outband cannot tell a restored
+  password from a new one, so it fails closed.
 
 ## Development
 

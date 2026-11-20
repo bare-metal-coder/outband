@@ -71,7 +71,11 @@ function legacyFingerprint(user) {
 }
 
 class NotBefore {
-    constructor(store, bus) { this.store = store; this.bus = bus; this.map = new Map(); this.timer = null; } // userid -> {fp, nb}
+    /**
+     * @param {function(): object} [getUsers] MeshCentral's in-memory user table. When given, it is the
+     *   one source of credential state for both the request path and the sweep (see observe).
+     */
+    constructor(store, bus, getUsers) { this.store = store; this.bus = bus; this.getUsers = getUsers || null; this.map = new Map(); this.timer = null; } // userid -> {fp, nb}
 
     async load() {
         for (const d of await this.store.userstate.find({})) { this.map.set(d._id, { fp: d.fp, nb: d.nb || 0 }); }
@@ -93,6 +97,11 @@ class NotBefore {
      */
     observe(user) {
         if ((user == null) || (typeof user._id != 'string')) return 0;
+        // One source of truth: MeshCentral authenticates passwords against its in-memory user table and
+        // updates it on every password change it makes, so that copy is used whenever it exists. Reading
+        // the database copy here and the memory copy in the sweep would flip between two states when they
+        // differ (a database write the running server never loaded) and revoke on every flip.
+        if (this.getUsers != null) { const users = this.getUsers(); const mem = users && users[user._id]; if (mem && (mem.type == 'user')) user = mem; }
         const fp = fingerprint(user);
         const cur = parseState(fp);
         let rec = this.map.get(user._id);
@@ -124,6 +133,7 @@ class NotBefore {
 
     start(getUsers) {
         if (this.timer != null) return;
+        if (this.getUsers == null) this.getUsers = getUsers;
         this.sweep(getUsers());
         this.timer = setInterval(() => { this.sweep(getUsers()); }, SWEEP_MS);
         if (this.timer.unref) this.timer.unref();

@@ -258,12 +258,50 @@ test('not_before: a positive passchange removed revokes (fail closed)', async fu
     });
 });
 
+test('not_before: database and memory copies that differ revoke at most once', async function () {
+    const set = { admin: users.admin, alice: { password: 'Alice-Pass-1', passchange: Math.floor(Date.now() / 1000) - 60 } };
+    await withServer({ users: set }, async function (h) {
+        const c = h.client();
+        await c.login('alice', set.alice.password);
+        await new Promise(function (r) { setTimeout(r, 5); });
+        const events = []; h.core.bus.on('credentials-changed', function (e) { events.push(e); });
+        // A database write the running server never loaded (e.g. a command-line reset while it runs)
+        h.dbDocs['user//alice'] = JSON.parse(JSON.stringify(h.users['user//alice']));
+        h.dbDocs['user//alice'].passchange = set.alice.passchange + 30;
+        const b = h.client();
+        for (let i = 0; i < 10; i++) {
+            h.core.notBefore.sweep(h.users);
+            await call(c, 'GET', '/api/v1/server');
+            await call(b, 'GET', '/api/v1/server');
+            h.core.notBefore.sweep(h.users);
+        }
+        assert.ok(events.length <= 1, 'revocations: ' + events.length);
+        // New sessions keep working across further cycles
+        const c2 = h.client();
+        assert.strictEqual((await c2.login('alice', set.alice.password)).status, 200);
+        const tok = await c2.post('/api/v1/auth/tokens', { json: { name: 'ro', scopes: ['read'] } });
+        for (let i = 0; i < 5; i++) {
+            h.core.notBefore.sweep(h.users);
+            assert.strictEqual((await call(c2, 'GET', '/api/v1/server')).status, 200);
+            assert.strictEqual((await call(b, 'GET', '/api/v1/server', { bearer: tok.body.secret })).status, 200);
+        }
+        assert.ok(events.length <= 1, 'revocations: ' + events.length);
+        // Once the server loads the new record (as on restart), the change is applied once
+        // (the login above saved the memory copy back to the database, as MeshCentral does)
+        const loaded = JSON.parse(JSON.stringify(h.users['user//alice'])); loaded.passchange = set.alice.passchange + 30;
+        h.users['user//alice'] = loaded; h.dbDocs['user//alice'] = JSON.parse(JSON.stringify(loaded));
+        for (let i = 0; i < 3; i++) { h.core.notBefore.sweep(h.users); await call(c2, 'GET', '/api/v1/server'); }
+        assert.strictEqual((await call(c2, 'GET', '/api/v1/server')).status, 401, 'the loaded change revokes');
+        assert.strictEqual(events.length, 1, 'exactly one revocation in total');
+    });
+});
+
 test('2FA completion re-checks not_before and lock state', async function () {
     await withServer({ users }, async function (h) {
         const c = h.client();
         await c.login('bob', users.bob.password);
         await new Promise(function (r) { setTimeout(r, 5); });
-        h.dbDocs['user//bob'].hash = 'changed'; h.dbDocs['user//bob'].passchange = Math.floor(Date.now() / 1000);
+        for (const u of [h.dbDocs['user//bob'], h.users['user//bob']]) { u.hash = 'changed'; u.passchange = Math.floor(Date.now() / 1000); }
         const r = await call(c, 'POST', '/api/v1/auth/2fa', { json: { code: '123456' } });
         assert.strictEqual(r.status, 401); assert.strictEqual(r.body.error.code, 'no_pending_login');
         // Malformed codes feed MeshCentral's per-IP 2FA counter
