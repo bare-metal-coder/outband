@@ -349,6 +349,45 @@ liveTest('live MeshCentral resources: groups, devices, events, stream', { timeou
         assert.strictEqual((await api('GET', '/api/v1/devices/' + ids.device + 'x', { bearer: tk.body.secret })).status, 404);
     });
 
+    await t.test('power and console against MeshCentral: path rules, tickets and the console subprotocol', async function () {
+        const cookie = alice;
+        const dev = await api('GET', '/api/v1/devices/' + ids.device, { cookie: cookie });
+        assert.strictEqual(dev.status, 200, dev.text);
+        assert.deepStrictEqual(dev.body.capabilities.power, []);
+        // agent offline, AMT not connected: 409 with the missing default path and nothing available
+        let r = await api('POST', '/api/v1/devices/' + ids.device + '/power', { csrf: true, cookie: cookie, json: { action: 'off' } });
+        assert.strictEqual(r.status, 409); assert.deepStrictEqual(r.body.error.details, { path: 'agent', available_paths: [] });
+        r = await api('POST', '/api/v1/devices/' + ids.device + '/power', { csrf: true, cookie: cookie, json: { action: 'off', via: 'amt' } });
+        assert.strictEqual(r.status, 409); assert.deepStrictEqual(r.body.error.details, { path: 'amt' });
+        r = await api('POST', '/api/v1/devices/LiveMissing000000001/power', { csrf: true, cookie: cookie, json: { action: 'on' } });
+        assert.strictEqual(r.status, 404);
+        r = await api('POST', '/api/v1/devices/' + ids.device + '/console/sol/ticket', { csrf: true, cookie: cookie });
+        assert.strictEqual(r.status, 409); assert.strictEqual(r.body.error.code, 'not_reachable');
+        // MeshCentral's WebSocket server: /api/v1 answers only outband.console.v1; other endpoints keep their behaviour
+        const upgrade = function (p, protocols) {
+            return new Promise(function (resolve) {
+                const req = https.request({ host: '127.0.0.1', port: PORT, servername: NAME, path: p, ca: fs.readFileSync(path.join(env.dir, 'root-cert-public.crt')), agent: false, headers: { host: HOST, cookie: cookie, origin: ORIGIN, connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-version': '13', 'sec-websocket-key': require('crypto').randomBytes(16).toString('base64'), 'sec-websocket-protocol': protocols } });
+                req.on('upgrade', function (res, sock) {
+                    const proto = res.headers['sec-websocket-protocol'] || null;
+                    let buf = Buffer.alloc(0);
+                    sock.on('data', function (d) { buf = Buffer.concat([buf, d]); });
+                    setTimeout(function () { sock.destroy(); resolve({ protocol: proto, closeCode: ((buf.length >= 4) && ((buf[0] & 0x0F) == 8)) ? buf.readUInt16BE(2) : null }); }, 1500);
+                });
+                req.on('response', function (res) { res.resume(); resolve({ status: res.statusCode }); });
+                req.on('error', function (e) { resolve({ error: e.message }); });
+                req.end();
+            });
+        };
+        const consolePath = '/api/v1/devices/' + ids.device + '/console/sol';
+        let u = await upgrade(consolePath, 'outband.ticket.' + 'A'.repeat(43) + ', outband.console.v1');
+        assert.strictEqual(u.protocol, 'outband.console.v1', 'the ticket is never echoed');
+        assert.strictEqual(u.closeCode, 4401, 'an unknown ticket is refused');
+        u = await upgrade(consolePath, 'outband.ticket.' + 'A'.repeat(43));
+        assert.strictEqual(u.protocol, null);
+        u = await upgrade('/control.ashx', 'example-protocol');
+        assert.strictEqual(u.protocol, 'example-protocol', 'other WebSockets keep the default choice');
+    });
+
     await t.test('stream: ready, and it ends with closed within 5 seconds of a revocation', async function () {
         const tk = await api('POST', '/api/v1/auth/tokens', { csrf: true, cookie: alice, json: { name: 'live-stream', scopes: ['read'] } });
         const s = await sse({ dir: env.dir, bearer: tk.body.secret, query: '?types=device.power,device.updated,resync' });

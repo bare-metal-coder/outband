@@ -10,6 +10,7 @@
  *   core.checkAuthCookie(cookie[, sessionRequired])  from checkAuthCookie and the relay cookie checks
  *   core.onLogout(userid, x)       from the legacy logout handler
  *   core.router()                  mounted at /api/v1
+ *   core.handleProtocols(set, req)  WebSocket subprotocol choice (the console answers outband.console.v1 only)
  * @license Apache-2.0
  */
 
@@ -24,7 +25,7 @@ const { Audit } = require('./audit');
 const { Pseudonyms } = require('./pseudonym');
 const { RuntimeSettings } = require('./settings');
 const { PendingLogins } = require('./pending');
-const { Tickets } = require('./tickets');
+const { Tickets, PROTOCOL: CONSOLE_PROTOCOL } = require('./tickets');
 const { Idempotency } = require('./idempotency');
 const { NotBefore } = require('./notbefore');
 const { WindowLimiter, FailureLock, ConcurrencyLimiter } = require('./ratelimit');
@@ -72,6 +73,17 @@ function create(webserver, parent, hooks, options) {
     core.apiDisabled = function () { return (core.config.enabled === false) || (parent.multiServer != null) || (parent.config && parent.config.peers != null); };
     core.revalidate = function (ctx) { return revalidate(core, ctx); };
     core.setResources = function (impl) { core.resources = impl; };
+    /**
+     * `handleProtocols` for MeshCentral's WebSocket server. Under /api/v1 only the console
+     * subprotocol is ever answered, so a ticket sent as a subprotocol is never echoed; every
+     * other WebSocket keeps the library default (the first protocol offered).
+     */
+    core.handleProtocols = function (protocols, req) {
+        const list = Array.isArray(protocols) ? protocols : Array.from(protocols || []); // ws 7 passes an array, ws 8 a Set
+        const path = String((req && req.url) || '').split('?')[0];
+        if (path.indexOf('/api/v1/') >= 0) return (list.indexOf(CONSOLE_PROTOCOL) >= 0) ? CONSOLE_PROTOCOL : false;
+        return list[0];
+    };
 
     core.onNewSession = function (req) {
         if ((core.sessions != null) && req && req.session) core.sessions.onNewSession(req.session.userid, req.session.x);
@@ -112,7 +124,9 @@ function create(webserver, parent, hooks, options) {
         await core.pseudonyms.load();
         await core.settings.load();
         await core.sessions.load();
-        await Promise.all([core.audit.purge(), core.tokens.purge(), core.idempotency.purge()]); // retention, also at startup
+        /** AMT certificate pins: kept while the device exists, and for 30 days after it is removed. Otherwise only the admin reset removes one. */
+        core.purgePins = function () { return store.amtpins.remove({ removed: { $lt: Date.now() - require('./console').PIN_TOMBSTONE_MS } }).catch(function () { }); };
+        await Promise.all([core.audit.purge(), core.tokens.purge(), core.idempotency.purge(), core.purgePins()]); // retention, also at startup
         // A credential change revokes the user's earlier tokens and sessions (listed as revoked).
         core.bus.on('credentials-changed', function (e) {
             core.tokens.revokeIssuedBefore(e.userid, e.notBefore, 'credentials_changed').catch(function () { });
@@ -123,12 +137,13 @@ function create(webserver, parent, hooks, options) {
             core.notBefore.start(function () { return webserver.users; });
             const every = function (ms, fn) { const t = setInterval(fn, ms); if (t.unref) t.unref(); core.timers.push(t); };
             every(60000, function () { core.sessions.sweep(); });
-            every(3600000, function () { core.audit.purge(); core.tokens.purge(); core.idempotency.purge(); });
+            every(3600000, function () { core.audit.purge(); core.tokens.purge(); core.idempotency.purge(); core.purgePins(); });
         }
         if ((typeof parent.AddEventDispatch == 'function')) {
             parent.AddEventDispatch(['*'], {
                 HandleEvent: function (source, event) {
                     if ((event != null) && (event.action == 'accountremove') && (typeof event.userid == 'string')) { core.eraseUser(event.userid).catch(function () { }); }
+                    if ((event != null) && (event.action == 'removenode') && (typeof event.nodeid == 'string')) { core.store.amtpins.update({ _id: event.nodeid }, { $set: { removed: Date.now() } }).catch(function () { }); } // the pin is kept (see core.purgePins)
                 }
             });
         }

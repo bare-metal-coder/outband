@@ -1,8 +1,8 @@
 /**
  * @description Outband API: the resource endpoints (groups, devices, device
- * events, events, stream). Power and the console relay are separate lanes
- * and stay as the `not_implemented` stubs; devices still report their
- * `capabilities`, computed from outband/power.js without dispatching.
+ * events, events, stream, power, console). Device `capabilities` and the
+ * power endpoint share one environment (mappers.powerEnv); reading a device
+ * never dispatches anything. The console relay is in outband/console.js.
  *
  * Order of checks for every endpoint: scope (403), then visibility (404,
  * identical for "missing" and "not visible"), MeshCentral rights,
@@ -12,8 +12,11 @@
 
 'use strict';
 
-const { ApiError, lastSegment } = require('./util');
-const { mapDevice, mapDeviceDetail, mapGroup, groupKind, CONN } = require('./mappers');
+const { ApiError, lastSegment, randomId } = require('./util');
+const { mapDevice, mapDeviceDetail, mapGroup, groupKind, powerEnv, CONN } = require('./mappers');
+const power = require('./power');
+const powerexec = require('./powerexec');
+const { createConsole } = require('./console');
 const events = require('./events');
 const { Hub } = require('./hub');
 const { createStream } = require('./stream');
@@ -184,10 +187,39 @@ function createResources(core) {
             return events.collect(ctx, { device: args.device, group: args.group, type: args.type, audit: args.audit, since: args.since, until: args.until }, args.limit, args.cursor);
         },
 
-        // Lanes that come later: the router answers 501 for these.
-        powerAction: async function () { throw new ApiError(501, 'not_implemented', 'Not implemented yet'); },
-        consoleTarget: async function () { throw new ApiError(501, 'not_implemented', 'Not implemented yet'); },
-        openConsole: function (wsock) { try { wsock.close(1011); } catch (ex) { } },
+        /**
+         * Order: scope (the router, then here), visibility (audited 404), MeshCentral rights and
+         * path rules (power.plan: 403 before any path detail, then 409), the per-device limit,
+         * then dispatch. Successes are audited with the group, so group members see them;
+         * denials carry no group, so only the caller (and domain-wide viewers) see them.
+         */
+        powerAction: async function (ctx, deviceId, body) {
+            const action = body.action, via = (body.via === undefined) ? null : body.via;
+            ctx.requireScope(power.scopeForAction(action));
+            const node = await visibleNode(ctx, deviceId);
+            const env = powerEnv(nodeInfo(ctx, node, { peers: agentPeers() }));
+            const actionId = randomId('act_', 12);
+            const auditBase = {
+                domain: ctx.domain.id, type: 'node', action: 'outband.power', user: ctx.userid, userName: ctx.user.name,
+                tokenId: ctx.token && ctx.token._id, tokenName: ctx.token && ctx.token.name, deviceId: node._id, actionId: actionId, ip: ctx.ip
+            };
+            let paths;
+            try { paths = power.plan(env, action, via); }
+            catch (ex) {
+                if ((ex instanceof ApiError) && (ex.status == 403)) {
+                    core.audit.deny(ctx.credentialKey, Object.assign({}, auditBase, { reason: 'forbidden', params: { power_action: action, path: (ex.details && ex.details.path) || via || 'default' } }));
+                }
+                throw ex;
+            }
+            const lim = core.limits.device.hit(node._id);
+            if (!lim.allowed) throw new ApiError(429, 'rate_limited', 'Too many power actions for this device', null, { 'Retry-After': String(lim.resetSec) });
+            await powerexec.dispatch(core, ctx, node, action, paths);
+            await core.audit.write(Object.assign({}, auditBase, { groupId: node.meshid, params: { power_action: action, path: paths.join(' and ') } }));
+            return { action_id: actionId, device_id: lastSegment(node._id), action: action, paths: paths, status: 'dispatched' };
+        },
+
+        consoleTarget: async function (ctx, deviceId, kind) { return consoles.target(ctx, deviceId, kind); },
+        openConsole: function (wsock, ctx, binding) { consoles.open(wsock, ctx, binding); },
 
         stream: null
     };
@@ -198,6 +230,12 @@ function createResources(core) {
         for (const n of nodes) { m.set(n.meshid, (m.get(n.meshid) || 0) + 1); }
         return m;
     }
+
+    const consoles = createConsole(core, {
+        visibleNode: visibleNode,
+        info: function (ctx, node) { return nodeInfo(ctx, node, {}); }
+    });
+    core.consoles = consoles;
 
     impl.stream = createStream(core, hub, {
         nodeMessage: async function (ctx, nodeid, entry) {

@@ -99,6 +99,14 @@ call:
 Also apply `core.limits.device.hit(deviceId)` (6 per minute per device) and
 audit every dispatch and every `403` (see Audit).
 
+`powerAction` in `outband/devices.js` does this, with the environment from
+`mappers.powerEnv(info)` (the same one `capabilities` uses), and sends the
+commands with `outband/powerexec.js` (agent `poweraction`, the AMT
+manager's `amtpoweraction`, Wake-on-LAN through the group's online agents,
+MQTT `powerAction`, IP-KVM port operations). Dispatched actions are
+audited with the group, so group members see them; denials carry no
+group, so only the caller (and domain-wide viewers) see them.
+
 ### Console
 
 `consoleTarget(ctx, deviceId, kind)` runs visibility, `console` scope,
@@ -108,6 +116,20 @@ atomically, re-checks the credential and Origin, and calls `consoleTarget`
 again before calling your `openConsole(ws, ctx, binding)`. Close with
 `4403` when `ctx.revalidate()` reports a reason, `4409` when the device
 becomes unreachable or busy.
+
+`outband/console.js` implements SOL: one session per device, Intel AMT
+redirection opened by the server with the AMT credentials MeshCentral
+holds (CIRA through MeshCentral's MPS server, else the local network), an
+Outband-owned pin of each device's AMT certificate (store collection
+`amtpins`: seeded from MeshCentral's hash or the first console, enforced on
+every connection, kept 30 days after the device is removed, reset only by
+`resetAmtPin`; TLS 1.2+ with a recorded per-device legacy fallback), a frame limit set before
+any upgrade check, backpressure limits both ways (CIRA writes wait for the
+channel's credits), an idle timeout and a re-check every 2.5 seconds.
+Tests can replace the transport with `core.consoleOptions.connect(node, verify, mode)`.
+MeshCentral's WebSocket server calls `core.handleProtocols`, which answers
+only `outband.console.v1` under `/api/v1`, so the ticket subprotocol is
+never echoed.
 
 ### Stream
 
@@ -179,11 +201,12 @@ and `test/outband/contract.js` (`check(method, path, response)` validates
 status, headers and body against the spec). Every new endpoint needs
 contract tests and tests for its refusals.
 
-## Reference implementation (groups, devices, events, stream)
+## Reference implementation (groups, devices, events, stream, power, console)
 
 * `outband/mappers.js`: every Device, DeviceDetail, Group and Event payload.
-* `outband/devices.js`: `createResources(core)`; wired in `outband/index.js`
-  with the power and console methods left as `not_implemented` stubs.
+* `outband/devices.js`: `createResources(core)`, wired in `outband/index.js`,
+  including `powerAction` (with `outband/powerexec.js`) and the console
+  methods (with `outband/console.js`).
 * `outband/events.js`: one event visibility rule (`eventVisible`) shared by
   `/events`, `/devices/{id}/events` and `/stream`.
 * `outband/hub.js` and `outband/stream.js`: the live feed (MeshCentral state
@@ -191,10 +214,10 @@ contract tests and tests for its refusals.
 * A device's `capabilities` come from `outband/power.js` and the mappers
   (`mapCapabilities`); nothing is dispatched when a device is read.
 
-For the power lane: `nodeInfo` in `outband/devices.js` builds the per-device
-facts (connectivity, group kind, rights, Wake-on-LAN peers) that the
-`power.plan` environment needs; `core.audit.write` feeds the stream, so a
-power audit record appears as an `event.created` message without extra code.
+`nodeInfo` in `outband/devices.js` builds the per-device facts
+(connectivity, group kind, rights, Wake-on-LAN peers) that the `power.plan`
+environment needs; `core.audit.write` feeds the stream, so a power audit
+record appears as an `event.created` message without extra code.
 
 Device `name`, `description` and `tags`, and group `name` and `description`,
 are visible to every caller that can see the device or group (scope `read`);

@@ -15,7 +15,7 @@
 const path = require('path');
 const Datastore = require('@seald-io/nedb');
 
-const COLLECTIONS = ['sessions', 'revocations', 'tokens', 'audit', 'settings', 'idempotency', 'userstate'];
+const COLLECTIONS = ['sessions', 'revocations', 'tokens', 'audit', 'settings', 'idempotency', 'userstate', 'amtpins'];
 /** Files are readable by the server account only. */
 const MODES = { fileMode: 0o600, dirMode: 0o700 };
 

@@ -18,6 +18,7 @@ const { Tickets, PROTOCOL } = require('./tickets');
 const { Idempotency } = require('./idempotency');
 const { fromTrustedProxy } = require('./util');
 const power = require('./power');
+const { capFrames, DEFAULTS: CONSOLE_DEFAULTS } = require('./console');
 
 const ID_RE = /^[A-Za-z0-9@$_-]{8,128}$/;
 const URL_CREDENTIALS = ['token', 'access_token', 'ticket'];
@@ -95,6 +96,17 @@ function buildRouter(core) {
     router.delete('/admin/tokens/:tokenId', R({ auth: 'required', session: true, admin: true }, tokH.adminRevoke));
     router.get('/admin/settings', R({ auth: 'required', session: true, admin: true }, tokH.getSettings));
     router.put('/admin/settings', R({ auth: 'required', session: true, admin: true }, tokH.putSettings));
+    // Reset the Outband pin of a device's Intel AMT certificate (after a legitimate certificate change).
+    router.delete('/admin/devices/:deviceId/amt-pin', R({ auth: 'required', session: true, admin: true }, async function (req, res, ctx) {
+        const deviceId = checkId(req.params.deviceId, 'deviceId');
+        ctx.requireStepUp();
+        const nodeid = 'node/' + ctx.domain.id + '/' + deviceId;
+        const removed = await core.store.amtpins.remove({ _id: nodeid });
+        if (!removed) throw new ApiError(404, 'not_found', 'No pin for this device');
+        const node = await new Promise(function (resolve) { try { ws.db.Get(nodeid, function (err, docs) { resolve((Array.isArray(docs) && docs.length == 1) ? docs[0] : null); }); } catch (ex) { resolve(null); } });
+        core.audit.write({ domain: ctx.domain.id, type: 'node', action: 'outband.console.pin', user: ctx.userid, userName: ctx.user.name, deviceId: nodeid, groupId: (node && (typeof node.meshid == 'string')) ? node.meshid : null, ip: ctx.ip, params: { kind: 'sol' } });
+        res.status(204).end();
+    }));
 
     // Resources (implemented through the Resources interface; stubs answer 501)
     router.get('/groups', R({ auth: 'required' }, async function (req, res, ctx) { sendPage(res, await res_().listGroups(ctx, pageArgs(req.query))); }));
@@ -120,14 +132,12 @@ function buildRouter(core) {
         if ((key !== undefined) && !Idempotency.validKey(key)) throw new ApiError(400, 'invalid_request', 'Invalid Idempotency-Key', { field: 'Idempotency-Key' });
         const lim = core.limits.action.hit(ctx.credentialKey);
         if (!lim.allowed) throw new ApiError(429, 'rate_limited', 'Too many power and console requests', null, { 'Retry-After': String(lim.resetSec) });
-        if (key !== undefined) {
-            const prev = await core.idempotency.lookup(ctx.credentialKey, key, 'power:' + deviceId, body);
-            if (prev && prev.conflict) throw new ApiError(409, 'idempotency_conflict', 'Idempotency-Key reused with a different body');
-            if (prev) { res.status(prev.status).json(prev.body); return; }
-        }
-        const result = await res_().powerAction(ctx, deviceId, { action: body.action, via: body.via }, { idempotencyKey: key || null });
-        if (key !== undefined) { await core.idempotency.save(ctx.credentialKey, key, 'power:' + deviceId, body, 202, result); }
-        res.status(202).json(result);
+        const act = function () { return res_().powerAction(ctx, deviceId, { action: body.action, via: body.via }, { idempotencyKey: key || null }); };
+        if (key === undefined) { res.status(202).json(await act()); return; }
+        // The key is reserved before anything is dispatched: concurrent requests with it dispatch once.
+        const r = await core.idempotency.run(ctx.credentialKey, key, 'power:' + deviceId, body, 202, act);
+        if (r.conflict) throw new ApiError(409, 'idempotency_conflict', 'Idempotency-Key reused with a different body');
+        res.status(r.status).json(r.body);
     }));
     const eventLimit = function (ctx) {
         const lim = core.limits.events.hit(ctx.credentialKey);
@@ -172,21 +182,32 @@ function buildRouter(core) {
         });
     }));
 
-    // Console WebSocket (needs express-ws, present in the MeshCentral server)
+    // Console WebSocket (needs express-ws, present in the MeshCentral server). The subprotocol
+    // answered is always `outband.console.v1` (core.handleProtocols); the ticket is never echoed.
     if (typeof router.ws == 'function') {
         router.ws('/devices/:deviceId/console/:kind', async function (wsock, req) {
+            capFrames(wsock, Object.assign({}, CONSOLE_DEFAULTS, core.consoleOptions || {}).maxFrame); // first: before any check is awaited
+            wsock.on('error', function () { }); // an over-size frame is an error event; ws closes the socket with 1009
             const close = function (code) { try { wsock.close(code); } catch (ex) { } };
             try {
                 const deviceId = req.params.deviceId, kind = req.params.kind;
-                const binding = core.tickets.consume(Tickets.fromProtocols(req.headers['sec-websocket-protocol']), deviceId, kind);
+                if (wsock.protocol !== PROTOCOL) { close(4401); return; }
+                const binding = core.tickets.consume(Tickets.fromProtocols(req.headers['sec-websocket-protocol']), deviceId, kind); // marks the ticket used
                 if (binding == null) { close(4401); return; }
                 if (binding.cookie && !require('./hostorigin').checkOrigin(req, req.xdomain, ws.certificates, ws.args)) { close(4401); return; }
                 let ctx = null;
-                try { ctx = await resolveCredential(core, req); } catch (ex) { ctx = null; }
-                if ((ctx == null) || (ctx.credentialKey != binding.credentialKey) || (ctx.userid != binding.userid)) { close(4403); return; }
-                try { await core.resources.consoleTarget(ctx, deviceId, kind); }
-                catch (ex) { close(((ex instanceof ApiError) && (ex.status == 409)) ? 4409 : ((ex instanceof ApiError) && (ex.status == 501)) ? 1011 : 4403); return; }
-                core.audit.write({ domain: ctx.domain.id, type: 'node', action: 'outband.console.open', user: ctx.userid, userName: ctx.user.name, tokenId: ctx.token && ctx.token._id, deviceId: 'node/' + ctx.domain.id + '/' + deviceId, ip: ctx.ip, params: { kind: kind } });
+                try { ctx = await resolveCredential(core, req); } catch (ex) { ctx = null; } // a bearer ticket needs Authorization here
+                if ((ctx == null) || (ctx.credentialKey != binding.credentialKey) || (ctx.userid != binding.userid) || !ctx.hasScope('console')) { close(4403); return; }
+                const auditBase = { domain: ctx.domain.id, type: 'node', action: 'outband.console.open', user: ctx.userid, userName: ctx.user.name, tokenId: ctx.token && ctx.token._id, tokenName: ctx.token && ctx.token.name, deviceId: 'node/' + ctx.domain.id + '/' + deviceId, ip: ctx.ip, params: { kind: kind } };
+                let target;
+                try { target = await core.resources.consoleTarget(ctx, deviceId, kind); } // rights and reachability again
+                catch (ex) {
+                    const st = (ex instanceof ApiError) ? ex.status : 500;
+                    if (st == 403) core.audit.deny(ctx.credentialKey, Object.assign({}, auditBase, { reason: ex.code }));
+                    close((st == 409) ? 4409 : (st == 501) ? 1011 : 4403); return;
+                }
+                if (wsock.readyState !== 1) return;
+                core.audit.write(Object.assign({}, auditBase, { groupId: target.groupId ? ('mesh/' + ctx.domain.id + '/' + lastSegment(target.groupId)) : null }));
                 core.resources.openConsole(wsock, ctx, { deviceId: deviceId, kind: kind });
             } catch (ex) { close(1011); }
         });
