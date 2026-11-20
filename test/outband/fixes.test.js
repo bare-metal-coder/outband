@@ -162,7 +162,8 @@ test('not_before: state transitions and migration of stored records', async func
     assert.strictEqual(isCredentialChange(-1, 1600000100), true, 'new password after a reset');
     assert.strictEqual(isCredentialChange(-1, -1), false);
     assert.strictEqual(isCredentialChange(1600000000, 1600000000), false);
-    assert.strictEqual(isCredentialChange(1600000100, 1600000000), false, 'passchange moving back is not a new password');
+    assert.strictEqual(isCredentialChange(1600000100, 1600000000), true, 'passchange moving back (server clock behind) is a new password');
+    assert.strictEqual(isCredentialChange(1600000000, 0), false, 'passchange cleared without a password');
     assert.strictEqual(isCredentialChange(-1, 0), false, 'reset flag cleared without a password');
 
     const store = await openStore({ inMemory: true });
@@ -185,6 +186,54 @@ test('not_before: state transitions and migration of stored records', async func
         nb.observe(plain); nb.observe(rehashed); nb.observe(reset);
         assert.strictEqual(events.length, 1, 'stable after migration');
     } finally { store.close(); }
+});
+
+test('not_before: a user first seen while a reset is pending keeps no earlier tokens or sessions', async function () {
+    const store = await openStore({ inMemory: true });
+    try {
+        const events = [];
+        const nb = new NotBefore(store, { emit: function (n, e) { events.push(e); } });
+        await nb.load();
+        const t0 = Date.now();
+        const v = nb.observe({ _id: 'user//r', type: 'user', passchange: -1 });
+        assert.ok(v >= t0, 'not_before is now');
+        assert.strictEqual(events.length, 1); assert.strictEqual(events[0].userid, 'user//r');
+        assert.strictEqual(nb.observe({ _id: 'user//r', type: 'user', passchange: -1 }), v, 'stable while the reset is pending');
+        assert.strictEqual(nb.observe({ _id: 'user//p', type: 'user', passchange: 1600000000 }), 1600000000 * 1000, 'other first observations start at passchange');
+        assert.strictEqual(events.length, 1);
+        await new Promise(function (r) { setTimeout(r, 20); });
+        assert.strictEqual((await store.userstate.findOne({ _id: 'user//r' })).nb, v, 'persisted');
+    } finally { store.close(); }
+    await withServer({ users }, async function (h) {
+        const c = h.client();
+        await c.login('alice', users.alice.password);
+        const tok = await c.post('/api/v1/auth/tokens', { json: { name: 'ro', scopes: ['read'] } });
+        await new Promise(function (r) { setTimeout(r, 5); });
+        h.core.notBefore.map.delete('user//alice'); // no stored state, e.g. Outband installed while a reset is pending
+        for (const u of [h.dbDocs['user//alice'], h.users['user//alice']]) { u.passchange = -1; }
+        const r = await call(h.client(), 'GET', '/api/v1/server', { bearer: tok.body.secret });
+        assert.strictEqual(r.status, 401); assert.strictEqual(r.body.error.code, 'token_revoked');
+        assert.strictEqual((await call(c, 'GET', '/api/v1/server')).status, 401);
+    });
+});
+
+test('not_before: passchange moving backward (new password, server clock behind) revokes', async function () {
+    const skewed = { admin: users.admin, alice: { password: 'Alice-Pass-1', passchange: Math.floor(Date.now() / 1000) - 60 } };
+    await withServer({ users: skewed }, async function (h) {
+        const c = h.client();
+        await c.login('alice', skewed.alice.password);
+        const tok = await c.post('/api/v1/auth/tokens', { json: { name: 'ro', scopes: ['read'] } });
+        const b = h.client();
+        assert.strictEqual((await call(b, 'GET', '/api/v1/server', { bearer: tok.body.secret })).status, 200);
+        await new Promise(function (r) { setTimeout(r, 5); });
+        for (const u of [h.dbDocs['user//alice'], h.users['user//alice']]) { u.salt = 'n'; u.hash = 'n'; u.passchange = skewed.alice.passchange - 3600; }
+        const r = await call(b, 'GET', '/api/v1/server', { bearer: tok.body.secret });
+        assert.strictEqual(r.status, 401); assert.strictEqual(r.body.error.code, 'token_revoked');
+        assert.strictEqual((await call(c, 'GET', '/api/v1/server')).status, 401);
+        const c2 = h.client();
+        assert.strictEqual((await c2.login('alice', skewed.alice.password)).status, 200);
+        assert.strictEqual((await call(c2, 'GET', '/api/v1/server')).status, 200, 'new logins work');
+    });
 });
 
 test('2FA completion re-checks not_before and lock state', async function () {

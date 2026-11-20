@@ -76,6 +76,16 @@ API settings go under `settings.outbandApi` in `config.json`:
   MeshCentral runs as part of a multi-server (peering) setup.
 * **API switch.** `settings.outbandApi.enabled: false` turns `/api/v1` off
   (every endpoint except `/api/v1/health` answers `503`).
+* **Credential changes and revocation.** Setting a new password in
+  MeshCentral (by any path) or an administrator's "change at next login"
+  reset ends the user's earlier `/api/v1` sessions and API tokens. A
+  password change made at an external identity provider (LDAP, SSO / OIDC,
+  SAML) is not visible to Outband and revokes nothing. When an account may
+  be compromised, revoke its tokens with `DELETE /api/v1/admin/tokens/{id}`
+  and lock the account in MeshCentral (a locked account's sessions and
+  tokens are refused on every request), or turn all bearer tokens off at
+  once with the kill switch (`PUT /api/v1/admin/settings` with
+  `{"bearer": false}`).
 
 ## Development
 
