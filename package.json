@@ -20,9 +20,13 @@
   "bin": {
     "meshcentral": "bin/meshcentral"
   },
+  "scripts": {
+    "test": "node --test --test-timeout=900000 \"test/outband/*.test.js\""
+  },
   "license": "Apache-2.0",
   "files": [
     "*.js",
+    "outband",
     "amt",
     "bin",
     "rdp",
@@ -60,7 +64,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Ylianst/MeshCentral.git"
+    "url": "https://github.com/bare-metal-coder/outband.git"
   },
-  "readme": "readme.md"
+  "readme": "readme.md",
+  "devDependencies": {
+    "@redocly/cli": "1.34.0",
+    "ajv": "8.17.1",
+    "ajv-formats": "3.0.1",
+    "yaml": "2.8.1"
+  }
 }

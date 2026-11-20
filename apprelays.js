@@ -4,6 +4,7 @@
 * @copyright Intel Corporation 2018-2022
 * @license Apache-2.0
 * @version v0.0.1
+* Modified by the Outband project (see NOTICE)
 */
 
 /*jslint node: true */
@@ -989,6 +990,7 @@ module.exports.CreateMstscRelay = function (parent, db, ws, req, args, domain) {
                     } else {
                         // Decode the authentication cookie
                         obj.cookie = parent.parent.decodeCookie(obj.infos.ip, parent.parent.loginCookieEncryptionKey);
+                        if ((obj.cookie != null) && (parent.outband.checkAuthCookie(obj.cookie, true) == false)) { obj.cookie = null; } // Outband: must come from a live session
                         if ((obj.cookie == null) || (typeof obj.cookie.nodeid != 'string') || (typeof obj.cookie.userid != 'string')) { obj.close(); return; }
                         obj.nodeid = obj.cookie.nodeid;
                         obj.userid = obj.cookie.userid;
@@ -1418,6 +1420,7 @@ module.exports.CreateSshRelay = function (parent, db, ws, req, args, domain) {
 
     // Decode the authentication cookie
     obj.cookie = parent.parent.decodeCookie(req.query.auth, parent.parent.loginCookieEncryptionKey);
+    if ((obj.cookie != null) && (parent.outband.checkAuthCookie(obj.cookie, true) == false)) { obj.cookie = null; } // Outband: must come from a live session
     if ((obj.cookie == null) || (obj.cookie.userid == null) || (parent.users[obj.cookie.userid] == null)) { obj.ws.send(JSON.stringify({ action: 'sessionerror' })); obj.close(); return; }
     obj.userid = obj.cookie.userid;
 

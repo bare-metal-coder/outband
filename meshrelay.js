@@ -4,6 +4,7 @@
 * @copyright Intel Corporation 2018-2022
 * @license Apache-2.0
 * @version v0.0.1
+* Modified by the Outband project (see NOTICE)
 */
 
 /*jslint node: true */
@@ -182,7 +183,8 @@ function CreateMeshRelayEx(parent, ws, req, domain, user, cookie) {
 
     // Check relay authentication
     if ((user == null) && (obj.req.query != null) && (obj.req.query.rauth != null)) {
-        const rcookie = parent.parent.decodeCookie(obj.req.query.rauth, parent.parent.loginCookieEncryptionKey, 240); // Cookie with 4 hour timeout
+        var rcookie = parent.parent.decodeCookie(obj.req.query.rauth, parent.parent.loginCookieEncryptionKey, 240); // Cookie with 4 hour timeout
+        if ((rcookie != null) && (parent.outband.checkAuthCookie(rcookie) == false)) { rcookie = null; } // Outband: session-bound cookies end with the session
         if (rcookie != null) { if (rcookie.ruserid != null) { obj.ruserid = rcookie.ruserid; } else if (rcookie.nouser === 1) { obj.rnouser = true; } }
     }
 
