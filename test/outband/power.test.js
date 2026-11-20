@@ -247,8 +247,10 @@ test('power: 6 actions per minute per device, across callers; replays do not cou
 /** A fake Intel AMT redirection endpoint: digest authentication, SOL settings, echoes terminal bytes in upper case. */
 function fakeAmt(user, pass, tlsOptions) {
     const seen = { auth: false, data: [], connections: 0, sockets: [] };
+    seen.protocols = []; seen.tlsErrors = 0;
     const handler = function (sock) {
         seen.connections++; seen.sockets.push(sock);
+        if (typeof sock.getProtocol == 'function') seen.protocols.push(sock.getProtocol());
         let acc = Buffer.alloc(0);
         const nonce = crypto.randomBytes(8).toString('hex'), realm = 'Digest:EXAMPLE', qop = 'auth';
         const lstr = function (s) { return Buffer.concat([Buffer.from([Buffer.byteLength(s)]), Buffer.from(s)]); };
@@ -292,6 +294,7 @@ function fakeAmt(user, pass, tlsOptions) {
         });
     };
     const server = tlsOptions ? require('tls').createServer(tlsOptions, handler) : net.createServer(handler);
+    server.on('tlsClientError', function () { seen.tlsErrors++; });
     const AUTHLEN = 2 + 1 + '/RedirectionService'.length + 4 + 1; // user prefix, two empty fields, uri, four zero bytes
     return new Promise(function (resolve) { server.listen(0, '127.0.0.1', function () { seen.port = server.address().port; seen.close = function () { for (const s of seen.sockets) s.destroy(); return new Promise(function (r) { server.close(r); }); }; resolve(seen); }); });
 }
@@ -737,4 +740,104 @@ test('power: concurrent requests with the same Idempotency-Key dispatch once', a
         assert.deepStrictEqual([a.status, b.status].sort(), [202, 409]);
         assert.strictEqual(h.sent.length, 2);
     });
+});
+
+/** Open one console as `c`; resolves {opened, s} after closing it again when it opened. */
+async function consoleOnce(h, c) {
+    const s = await openWs(h, protocolsOf(await ticketFor(h, { client: c })), { client: c });
+    assert.ok(await s.waitFor(function (x) { return x.closeCode != null || x.states.some(function (m) { return m.state == 'open'; }); }, 8000));
+    const opened = s.states.some(function (m) { return m.state == 'open'; });
+    if (opened) { s.ws.close(); await s.closed(); await sleep(50); }
+    return { opened: opened, s: s };
+}
+
+test('console: a removed device keeps its pin; re-added with the same id it must present the pinned certificate', async function () {
+    const certA = selfSigned(), certB = selfSigned();
+    let amt = await fakeAmt(AMT_USER, AMT_PASS, { key: certA.key, cert: certA.cert });
+    try {
+        await withWorld(async function (h) {
+            h.parent.mpsserver = fakeMps(function () { return amt.port; }, [16995]);
+            const c = await session(h, 'alice');
+            assert.ok((await consoleOnce(h, c)).opened);
+            await sleep(20);
+            // MeshCentral removes the device; the pin is kept as a tombstone
+            h.dispatch({ etype: 'node', action: 'removenode', nodeid: FN1, meshid: MA, domain: '' });
+            await sleep(20);
+            const tomb = await h.core.store.amtpins.findOne({ _id: FN1 });
+            assert.strictEqual(tomb.hash, certA.sha384); assert.ok(tomb.removed > 0);
+            // re-added with the same id, presenting another certificate (MeshCentral tracks the new hash): refused
+            h.dbDocs[FN1].intelamt.hash = certB.sha384;
+            await amt.close();
+            amt = await fakeAmt(AMT_USER, AMT_PASS, { key: certB.key, cert: certB.cert });
+            const log = console.log; console.log = function () { };
+            let r; try { r = await consoleOnce(h, c); } finally { console.log = log; }
+            assert.ok(!r.opened); assert.strictEqual(r.s.closeCode, 4409); assert.strictEqual(r.s.states.pop().reason, 'cert_changed');
+            assert.strictEqual(amt.auth, false);
+            await sleep(20);
+            assert.strictEqual((await h.core.store.audit.find({ action: 'outband.console.pin', outcome: 'denied' })).length, 1);
+            // re-added with the pinned certificate: accepted, and the pin is active again
+            await amt.close();
+            amt = await fakeAmt(AMT_USER, AMT_PASS, { key: certA.key, cert: certA.cert });
+            assert.ok((await consoleOnce(h, c)).opened);
+            await sleep(20);
+            assert.strictEqual((await h.core.store.amtpins.findOne({ _id: FN1 })).removed, undefined);
+            // retention: a tombstone older than 30 days goes, an active pin stays
+            await h.core.store.amtpins.insert({ _id: 'node//OldRemoved0001', hash: certB.sha384, source: 'first_use', time: 1, removed: Date.now() - 31 * 86400000 });
+            await h.core.store.amtpins.insert({ _id: 'node//NewRemoved0001', hash: certB.sha384, source: 'first_use', time: 1, removed: Date.now() - 86400000 });
+            await h.core.purgePins();
+            assert.strictEqual(await h.core.store.amtpins.findOne({ _id: 'node//OldRemoved0001' }), null);
+            assert.ok(await h.core.store.amtpins.findOne({ _id: 'node//NewRemoved0001' }));
+            assert.ok(await h.core.store.amtpins.findOne({ _id: FN1 }));
+        });
+    } finally { await amt.close(); }
+});
+
+test('console: modern TLS by default; a device that only speaks old TLS falls back once, recorded with its pin, still pinned', async function () {
+    const certA = selfSigned(), certB = selfSigned();
+    const oldTls = function (cert) { return { key: cert.key, cert: cert.cert, minVersion: 'TLSv1', maxVersion: 'TLSv1.1', ciphers: 'AES128-SHA:AES256-SHA:@SECLEVEL=0' }; };
+    // modern
+    let amt = await fakeAmt(AMT_USER, AMT_PASS, { key: certA.key, cert: certA.cert });
+    try {
+        await withWorld(async function (h) {
+            h.parent.mpsserver = fakeMps(function () { return amt.port; }, [16995]);
+            const c = await session(h, 'alice');
+            assert.ok((await consoleOnce(h, c)).opened);
+            assert.ok(['TLSv1.2', 'TLSv1.3'].includes(amt.protocols[0]), String(amt.protocols));
+            await sleep(20);
+            assert.strictEqual((await h.core.store.amtpins.findOne({ _id: FN1 })).legacy_tls, false);
+        });
+    } finally { await amt.close(); }
+    // legacy-only firmware
+    amt = await fakeAmt(AMT_USER, AMT_PASS, oldTls(certA));
+    try {
+        await withWorld(async function (h) {
+            h.parent.mpsserver = fakeMps(function () { return amt.port; }, [16995]);
+            const c = await session(h, 'alice');
+            assert.ok((await consoleOnce(h, c)).opened, 'fell back to the legacy mode');
+            assert.strictEqual(amt.tlsErrors, 1, 'one failed modern handshake');
+            assert.deepStrictEqual(amt.protocols, ['TLSv1.1']);
+            await sleep(20);
+            let pin = await h.core.store.amtpins.findOne({ _id: FN1 });
+            assert.strictEqual(pin.legacy_tls, true); assert.strictEqual(pin.hash, certA.sha384);
+            // later connects use the recorded mode directly
+            assert.ok((await consoleOnce(h, c)).opened);
+            assert.strictEqual(amt.tlsErrors, 1, 'no second modern attempt');
+            // the pin is enforced in the legacy mode too
+            await amt.close();
+            amt = await fakeAmt(AMT_USER, AMT_PASS, oldTls(certB));
+            const log = console.log; console.log = function () { };
+            let r; try { r = await consoleOnce(h, c); } finally { console.log = log; }
+            assert.ok(!r.opened); assert.strictEqual(r.s.closeCode, 4409); assert.strictEqual(r.s.states.pop().reason, 'cert_changed');
+            assert.strictEqual(amt.auth, false);
+            // the admin reset clears the pin and the recorded mode
+            const adm = await session(h, 'admin');
+            assert.strictEqual((await call(adm, 'DELETE', '/api/v1/admin/devices/' + N1 + '/amt-pin')).status, 204);
+            assert.strictEqual(await h.core.store.amtpins.findOne({ _id: FN1 }), null);
+            assert.ok((await consoleOnce(h, c)).opened, 'pins certificate B, detecting the mode again');
+            assert.strictEqual(amt.tlsErrors, 1);
+            await sleep(20);
+            pin = await h.core.store.amtpins.findOne({ _id: FN1 });
+            assert.strictEqual(pin.hash, certB.sha384); assert.strictEqual(pin.legacy_tls, true);
+        });
+    } finally { await amt.close(); }
 });

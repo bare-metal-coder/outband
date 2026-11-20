@@ -89,7 +89,10 @@ API settings go under `settings.outbandApi` in `config.json`:
 * **Serial-over-LAN consoles.** The server opens Intel AMT redirection
   itself and pins each device's AMT certificate on first use; a changed
   certificate is refused until a full site administrator resets the pin
-  (`DELETE /api/v1/admin/devices/{id}/amt-pin`). Configure AMT with TLS
+  (`DELETE /api/v1/admin/devices/{id}/amt-pin`). Pins are kept while the
+  device exists and for 30 days after it is removed. TLS 1.2 or later is
+  used; a device whose firmware only offers older TLS is detected once and
+  recorded with its pin (the pin still applies). Configure AMT with TLS
   (port 16995) or use CIRA: without TLS, the redirection port 16994 carries
   the digest exchange and the keystrokes in clear on the local network.
 * **Database restores.** Restoring a MeshCentral database backup revokes

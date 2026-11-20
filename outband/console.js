@@ -48,6 +48,9 @@ function u16(n) { const b = Buffer.alloc(2); b.writeUInt16LE(n & 0xFFFF, 0); ret
 function lstr(s) { const b = Buffer.from(String(s), 'utf8'); return Buffer.concat([Buffer.from([b.length & 0xFF]), b]); }
 function md5hex(s) { return crypto.createHash('md5').update(s, 'utf8').digest('hex'); }
 
+/** A removed device's pin is kept this long, so a device re-added with the same id is checked against it. */
+const PIN_TOMBSTONE_MS = 30 * 86400000;
+
 const START_SOL = Buffer.from([0x10, 0x00, 0x00, 0x00, 0x53, 0x4F, 0x4C, 0x20]);
 const AUTH_URI = '/RedirectionService';
 
@@ -184,14 +187,22 @@ function certMatches(cert, hash) {
 }
 
 /**
- * TLS options for Intel AMT. AMT presents a self-signed firmware certificate that
- * cannot be validated against a CA, so chain validation is off; the peer
- * certificate is pinned instead (see `verify` in createConsole: pinned on first
- * use in Outband's own store and enforced on every connection).
+ * TLS options for Intel AMT, by mode. AMT presents a self-signed firmware
+ * certificate that cannot be validated against a CA, so chain validation is off;
+ * the peer certificate is pinned instead (see `verify` in createConsole: pinned on
+ * first use in Outband's own store and enforced on every connection).
+ *   modern  TLS 1.2 or later, no legacy renegotiation (the default);
+ *   legacy  TLS 1.0 or later, the RSA/AES suites older AMT firmware offers, and
+ *           legacy renegotiation. Used only for a device whose modern handshake
+ *           failed (auto-detected, recorded with its pin). Node does not verify the
+ *           peer certificate again on renegotiation, so in this mode the pin, checked
+ *           at the handshake, is the only protection against a renegotiation to
+ *           another peer.
  */
-function amtTlsOptions() {
+function amtTlsOptions(mode) {
+    if (mode !== 'legacy') return { minVersion: 'TLSv1.2', rejectUnauthorized: false };
     const constants = require('constants');
-    return { ciphers: 'RSA+AES:!aNULL:!MD5:!DSS', minVersion: 'TLSv1', secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE | constants.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION, rejectUnauthorized: false };
+    return { ciphers: 'RSA+AES:!aNULL:!MD5:!DSS:@SECLEVEL=0', minVersion: 'TLSv1', secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE | constants.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION, rejectUnauthorized: false };
 }
 
 /**
@@ -203,9 +214,12 @@ function socketTransport(sock, openEvent, verify) {
     const t = new EventEmitter();
     let closed = false;
     t.failure = null;
+    t.tls = (openEvent == 'secureConnect'); t.handshook = false; t.reached = false;
     const end = function () { if (closed) return; closed = true; try { sock.destroy(); } catch (ex) { } t.emit('close'); };
+    sock.on('connect', function () { t.reached = true; });
     sock.on(openEvent, function () {
         if (openEvent != 'secureConnect') { t.emit('open'); return; }
+        t.handshook = true;
         if (typeof verify != 'function') { t.failure = 'cert_changed'; end(); return; }
         let cert = null;
         try { cert = sock.getPeerCertificate(); } catch (ex) { cert = null; }
@@ -232,7 +246,7 @@ function channelBacklog(chnl) { return (chnl && chnl.sendBuffer) ? chnl.sendBuff
  * device grants no credits, so writes are held until the channel reports the
  * buffer sent (`onSendOk`), and `pending()` counts the channel's buffer too.
  */
-function ciraTransport(mps, ciraconn, verify) {
+function ciraTransport(mps, ciraconn, verify, mode) {
     const plain = (ciraconn.tag.boundPorts.indexOf(16994) >= 0);
     const chnl = mps.SetupChannel(ciraconn, plain ? 16994 : 16995);
     if (plain) {
@@ -259,9 +273,9 @@ function ciraTransport(mps, ciraconn, verify) {
     });
     chnl.onData = function (c, data) { tunnel.push(Buffer.isBuffer(data) ? data : Buffer.from(data, 'binary')); };
     chnl.onSendOk = release;
-    const tlsock = require('tls').connect(Object.assign({ socket: tunnel }, amtTlsOptions()));
+    const tlsock = require('tls').connect(Object.assign({ socket: tunnel }, amtTlsOptions(mode)));
     const t = socketTransport(tlsock, 'secureConnect', verify);
-    chnl.onStateChange = function (c, state) { if (state == 0) t.close(); };
+    chnl.onStateChange = function (c, state) { if (state == 2) t.reached = true; else if (state == 0) t.close(); };
     const close = t.close;
     t.close = function () { held = null; try { chnl.close(); } catch (ex) { } close(); };
     t.pending = function () { return (tlsock.writableLength || 0) + (tunnel.writableLength || 0) + channelBacklog(chnl); };
@@ -269,15 +283,15 @@ function ciraTransport(mps, ciraconn, verify) {
 }
 
 /** MeshCentral's way to reach the device's AMT redirection port: CIRA first, then the local network. */
-function defaultConnect(core, node, verify) {
+function defaultConnect(core, node, verify, mode) {
     const parent = core.parent;
     const mps = parent.mpsserver;
     const ciraconn = (mps != null) ? mps.GetConnectionToNode(node._id, null, true) : null;
-    if (ciraconn != null) return ciraTransport(mps, ciraconn, verify);
+    if (ciraconn != null) return ciraTransport(mps, ciraconn, verify, mode);
     const s = (typeof parent.GetConnectivityState == 'function') ? parent.GetConnectivityState(node._id) : null;
     if (s && ((s.connectivity & CONN.AMT) != 0) && (typeof node.host == 'string') && node.host) {
         if (node.intelamt.tls == 1) {
-            const sock = require('tls').connect(Object.assign({ host: node.host, port: 16995 }, amtTlsOptions()));
+            const sock = require('tls').connect(Object.assign({ host: node.host, port: 16995 }, amtTlsOptions(mode)));
             return socketTransport(sock, 'secureConnect', verify);
         }
         // Without TLS on the device, the redirection port carries the digest exchange and the keystrokes in clear.
@@ -285,6 +299,37 @@ function defaultConnect(core, node, verify) {
         return socketTransport(sock, 'connect', null);
     }
     return null;
+}
+
+/**
+ * A transport that falls back to the legacy TLS mode once, for a device whose
+ * modern TLS handshake failed after the connection was reached. `t.mode` tells
+ * which mode carried the session. A certificate that does not match the pin is
+ * never retried.
+ */
+function fallbackTransport(first, make, mode) {
+    const t = new EventEmitter();
+    let inner = null, opened = false, closed = false;
+    t.mode = mode; t.failure = null; t.tls = !!first.tls;
+    const attach = function (x) {
+        inner = x;
+        x.on('open', function () { if (closed) return; opened = true; t.emit('open'); });
+        x.on('data', function (d) { if (!closed) t.emit('data', d); });
+        x.on('close', function () {
+            if (closed || (inner !== x)) return;
+            if (!opened && x.tls && x.reached && !x.handshook && (x.failure == null) && (t.mode == 'modern')) {
+                let next = null;
+                try { next = make('legacy'); } catch (ex) { next = null; }
+                if (next != null) { t.mode = 'legacy'; attach(next); return; }
+            }
+            closed = true; t.failure = x.failure; t.emit('close');
+        });
+    };
+    attach(first);
+    t.write = function (b) { if (!closed) inner.write(b); };
+    t.pending = function () { return inner.pending ? inner.pending() : 0; };
+    t.close = function () { if (closed) return; closed = true; t.failure = inner.failure; try { inner.close(); } catch (ex) { } t.emit('close'); };
+    return t;
 }
 
 /**
@@ -341,7 +386,7 @@ function createConsole(core, deps) {
         return true;
     }
 
-    /** Remove a device's pin; the next console that opens pins the certificate it sees. */
+    /** Remove a device's pin (and its TLS mode); the next console that opens pins the certificate it sees. */
     async function resetPin(nodeid) { return core.store.amtpins.remove({ _id: nodeid }); }
 
     async function target(ctx, deviceId, kind) {
@@ -417,13 +462,27 @@ function createConsole(core, deps) {
             if (closed) return;
             if ((node == null) || (node.intelamt == null) || (typeof node.intelamt.user != 'string') || (typeof node.intelamt.pass != 'string')) { finish(4409, 'unreachable'); return; }
             const verifier = function (cert) { return verify(node, cert, session); };
-            try { transport = (typeof o.connect == 'function') ? o.connect(node, verifier) : defaultConnect(core, node, verifier); } catch (ex) { transport = null; }
-            if (transport == null) { finish(4409, 'unreachable'); return; }
+            const pinned = await core.store.amtpins.findOne({ _id: node._id }).catch(function () { return null; });
+            if (closed) return;
+            const mode = (pinned && (pinned.legacy_tls === true)) ? 'legacy' : 'modern';
+            const make = function (m) { return (typeof o.connect == 'function') ? o.connect(node, verifier, m) : defaultConnect(core, node, verifier, m); };
+            let first = null;
+            try { first = make(mode); } catch (ex) { first = null; }
+            if (first == null) { finish(4409, 'unreachable'); return; }
+            transport = fallbackTransport(first, make, mode);
             sol = new SolClient(transport, node.intelamt.user, node.intelamt.pass);
             connectTimer = setTimeout(function () { if (sol.state != 1) finish(4409, 'unreachable'); }, o.connectTimeoutMs);
             sol.on('open', function () {
                 clearTimeout(connectTimer); lastActivity = Date.now();
-                if (session.firstUse) { core.store.amtpins.insert({ _id: node._id, hash: session.firstUse, source: 'first_use', time: Date.now() }).catch(function () { }); session.firstUse = null; }
+                const legacy = transport.tls && (transport.mode == 'legacy');
+                if (session.firstUse) {
+                    core.store.amtpins.insert({ _id: node._id, hash: session.firstUse, source: 'first_use', time: Date.now(), legacy_tls: legacy }).catch(function () { });
+                    session.firstUse = null;
+                } else if (transport.tls) {
+                    // A re-added device that presented its pinned certificate is active again; record the TLS mode that worked.
+                    const set = legacy ? { $set: { legacy_tls: true }, $unset: { removed: true } } : { $unset: { removed: true } };
+                    core.store.amtpins.update({ _id: node._id }, set).catch(function () { });
+                }
                 state('open');
             });
             sol.on('data', function (d) {
@@ -447,4 +506,4 @@ function createConsole(core, deps) {
     return { target: target, open: open, busy: busy, resetPin: resetPin };
 }
 
-module.exports = { createConsole, SolClient, socketTransport, ciraTransport, certMatches, capFrames, DEFAULTS };
+module.exports = { createConsole, SolClient, socketTransport, ciraTransport, fallbackTransport, amtTlsOptions, certMatches, capFrames, PIN_TOMBSTONE_MS, DEFAULTS };

@@ -124,7 +124,9 @@ function create(webserver, parent, hooks, options) {
         await core.pseudonyms.load();
         await core.settings.load();
         await core.sessions.load();
-        await Promise.all([core.audit.purge(), core.tokens.purge(), core.idempotency.purge()]); // retention, also at startup
+        /** AMT certificate pins: kept while the device exists, and for 30 days after it is removed. Otherwise only the admin reset removes one. */
+        core.purgePins = function () { return store.amtpins.remove({ removed: { $lt: Date.now() - require('./console').PIN_TOMBSTONE_MS } }).catch(function () { }); };
+        await Promise.all([core.audit.purge(), core.tokens.purge(), core.idempotency.purge(), core.purgePins()]); // retention, also at startup
         // A credential change revokes the user's earlier tokens and sessions (listed as revoked).
         core.bus.on('credentials-changed', function (e) {
             core.tokens.revokeIssuedBefore(e.userid, e.notBefore, 'credentials_changed').catch(function () { });
@@ -135,13 +137,13 @@ function create(webserver, parent, hooks, options) {
             core.notBefore.start(function () { return webserver.users; });
             const every = function (ms, fn) { const t = setInterval(fn, ms); if (t.unref) t.unref(); core.timers.push(t); };
             every(60000, function () { core.sessions.sweep(); });
-            every(3600000, function () { core.audit.purge(); core.tokens.purge(); core.idempotency.purge(); });
+            every(3600000, function () { core.audit.purge(); core.tokens.purge(); core.idempotency.purge(); core.purgePins(); });
         }
         if ((typeof parent.AddEventDispatch == 'function')) {
             parent.AddEventDispatch(['*'], {
                 HandleEvent: function (source, event) {
                     if ((event != null) && (event.action == 'accountremove') && (typeof event.userid == 'string')) { core.eraseUser(event.userid).catch(function () { }); }
-                    if ((event != null) && (event.action == 'removenode') && (typeof event.nodeid == 'string')) { core.store.amtpins.remove({ _id: event.nodeid }).catch(function () { }); } // a removed device's AMT pin goes too
+                    if ((event != null) && (event.action == 'removenode') && (typeof event.nodeid == 'string')) { core.store.amtpins.update({ _id: event.nodeid }, { $set: { removed: Date.now() } }).catch(function () { }); } // the pin is kept (see core.purgePins)
                 }
             });
         }

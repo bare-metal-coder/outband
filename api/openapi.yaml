@@ -1394,7 +1394,16 @@ paths:
         then enforced on every connection, even if MeshCentral's stored hash
         changes. A certificate that does not match is refused (`4409`, state
         reason `cert_changed`) and audited. A full site administrator can
-        reset the pin (`resetAmtPin`) after checking the device.
+        reset the pin (`resetAmtPin`) after checking the device. A pin is
+        kept while the device exists and for 30 days after it is removed, so
+        a device added again with the same id must present the pinned
+        certificate.
+
+        **TLS version.** The server connects with TLS 1.2 or later. Only
+        when that handshake fails does it retry that device once with the
+        older TLS versions and renegotiation that early AMT firmware needs,
+        and it records this with the device's pin; the pin is enforced in
+        both modes. Resetting the pin also clears the recorded mode.
 
         **Transport.** When a device's AMT redirection port is reached
         without TLS (port 16994 on the local network), the digest exchange
