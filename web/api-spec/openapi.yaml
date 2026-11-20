@@ -1,0 +1,1170 @@
+openapi: 3.1.0
+info:
+  title: Outband API
+  version: 1.0.0-draft.1
+  summary: Public, versioned HTTP API for Outband (a MeshCentral fork).
+  description: |
+    The Outband API is the only interface the Outband web UI uses. Third-party
+    clients, such as automation tools, use the same API. It is a facade over
+    MeshCentral's own internals: the same database, the same permission checks
+    and the same power and event functions that MeshCentral's websocket
+    protocol (`control.ashx`) uses. Clients never need to speak
+    `control.ashx`.
+
+    ## Versioning
+    All endpoints live under `/api/v1`. Within v1, changes are additive only:
+    new endpoints, new optional fields and new enum values. Clients must ignore
+    unknown fields and treat unknown enum values as "unknown". Breaking changes
+    ship as `/api/v2`, and v1 keeps running alongside it for at least one minor
+    release. The response header `Outband-API-Version` carries the
+    `info.version` of the server's spec.
+
+    ## Authentication
+    The API takes two credentials. A request carries one of them.
+
+    1. **Browser session** (`cookieSession`). `POST /api/v1/auth/login` (plus
+       `POST /api/v1/auth/2fa` when needed) creates the same signed
+       cookie-session (`xid`) that MeshCentral's own login creates. That one
+       cookie therefore also works on MeshCentral's websocket and relay
+       endpoints. Cookies set by the API are `HttpOnly`, `Secure` and
+       `SameSite=Strict`.
+       **CSRF:** any request that uses cookie authentication and is not
+       `GET`/`HEAD` must send the header `X-Outband: 1`. It must also pass
+       MeshCentral's origin check (`Origin` matches the domain's DNS name or
+       the certificate name, or `allowedOrigin`). Otherwise the server returns
+       `403 csrf_failed`.
+    2. **API token** (`bearerToken`). Send `Authorization: Bearer obt_...`.
+       A user creates tokens through `/api/v1/auth/tokens` from a browser
+       session. Each token is shown once, then stored only as a SHA-256 hash.
+       It has an expiry, scopes, and can be revoked. Bearer requests skip the
+       CSRF header check. If a request carries both a bearer token and a
+       cookie, only the bearer token counts.
+
+    ## Authorization
+    Each request has to pass two checks:
+    * **Scope** (tokens only; a browser session holds every scope): `read`,
+      `power` or `console`. Every scope implies `read`.
+    * **MeshCentral rights** of the token's owning user on the device or
+      group, from the user's `links` and user-group memberships. That is the
+      same `GetNodeWithRights` / `GetMeshRights` result the legacy UI gets.
+      The table below shows how each operation maps to MeshCentral's
+      `MESHRIGHT_*` bits (meshuser.js). Full rights (`0xFFFFFFFF`) bypass the
+      "must not have" restrictions, as they do in MeshCentral.
+
+    | Operation | Token scope | Required mesh right | Must NOT have |
+    |---|---|---|---|
+    | List/read group or device | read | any right on the group/device (visible) | — |
+    | Device events | read | visible | `LIMITEVENTS` (0x2000) limits to the caller's own events |
+    | power `on` (AMT) | power | `WAKEDEVICE` (0x40) | `NOAMT` (0x800) |
+    | power `wake` (Wake-on-LAN; adds AMT power-up unless `NOAMT`) | power | `WAKEDEVICE` (0x40) | — |
+    | power `off`, `reset`, `sleep` (agent) | power | `RESETOFF` (0x40000) | — |
+    | power `off`, `reset`, `cycle` (AMT) | power | `RESETOFF` (0x40000) | `NOAMT` (0x800) |
+    | console `sol` | console | `REMOTECONTROL` (0x8) | `NOAMT` (0x800) |
+    | console `terminal` (later) | console | `REMOTECONTROL` (0x8) | `NOTERMINAL` (0x200), `REMOTEVIEWONLY` (0x100) |
+    | Global event log (all domains) | read | site right `ALLEVENTS` (0x800) or full site admin | — |
+
+    A device the caller cannot see returns `404 not_found`, never `403`, so
+    callers cannot probe whether a device exists. `403 forbidden` means the
+    caller can see the device but lacks the right or scope for the action.
+    A device's `capabilities` field already reflects both checks, so a UI can
+    hide actions the caller cannot perform.
+
+    ## Auditing
+    Every state-changing request (login, logout, 2FA, token create/revoke,
+    power, console ticket) writes an event to MeshCentral's event log. It
+    carries the user, the token name (when a token was used), the source IP
+    and the outcome. These events show up in `/api/v1/events` and in the
+    legacy UI. Failed logins are logged as MeshCentral already logs them.
+
+    ## Secrets
+    No response ever contains passwords, password hashes, OTP secrets,
+    recovery codes, Intel AMT credentials (`intelamt.user`/`pass`/`mpspass`),
+    agent certificates or keys, or token secrets (except the one response
+    that creates a token). The server never logs tokens. In request logs the
+    `Authorization` header and the `password`/`token` body fields are always
+    redacted.
+
+    ## Identifiers
+    MeshCentral ids look like `node/<domain>/<base64>`. The API exposes only
+    the last segment (`<base64>`, which uses MeshCentral's `@`/`$` alphabet
+    and is URL-path safe). The domain comes from the request's host, as in
+    MeshCentral.
+
+    ## Errors
+    Every non-2xx response has the body `{"error": {...}}` (schema `Error`)
+    and the matching HTTP status. `code` is stable and machine-readable;
+    `message` is for humans and may change.
+
+    ## Pagination
+    List endpoints that can grow without bound take `limit` (default 50,
+    max 200) and `cursor`. They return `{"items": [...], "next_cursor": "..."}`.
+    `next_cursor` is `null` on the last page. Cursors are opaque; a client
+    must not parse or build them. Events come newest first.
+
+    ## Rate limits
+    Login and 2FA use MeshCentral's existing protections: per-IP invalid-login
+    limits (`settings.maxInvalidLogin`), per-account lockout and 2FA
+    attempt limits. Other requests are limited per credential (per token, or
+    per session user): 600 requests/minute by default, and 30 power or
+    console-ticket requests/minute. Operators can change these with the
+    domain setting `outbandApi.rateLimits`. When a request is over a limit
+    the server returns `429 rate_limited` with `Retry-After` (seconds). Every
+    response carries `RateLimit-Limit`, `RateLimit-Remaining` and
+    `RateLimit-Reset`.
+
+    ## Live updates
+    `GET /api/v1/stream` is a Server-Sent Events stream (see that operation).
+    Console streams (Intel AMT Serial-over-LAN now; the agent terminal later)
+    are WebSockets at `/api/v1/devices/{id}/console/{kind}`. A client opens
+    one with a single-use ticket that lasts 60 seconds, from
+    `POST /api/v1/devices/{id}/console/{kind}/ticket`. Browsers cannot set
+    headers on a WebSocket, which is why the ticket rides in the URL.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: /
+    description: The Outband server that serves this document
+tags:
+  - name: auth
+    description: Browser sessions, two-factor login and API tokens.
+  - name: server
+    description: Health and server information.
+  - name: groups
+    description: Device groups (MeshCentral "meshes").
+  - name: devices
+    description: Managed devices (MeshCentral nodes).
+  - name: power
+    description: Power control through the agent, Intel AMT or Wake-on-LAN.
+  - name: console
+    description: Console WebSockets (Serial-over-LAN, later the agent terminal).
+  - name: events
+    description: Event and audit log.
+  - name: stream
+    description: Server-Sent Events for live updates.
+
+security:
+  - cookieSession: []
+  - bearerToken: []
+
+paths:
+  /api/v1/health:
+    get:
+      tags: [server]
+      operationId: getHealth
+      summary: Liveness and readiness
+      description: Needs no authentication. Shows nothing about configuration.
+      security: []
+      responses:
+        '200':
+          description: Server is up and the database answers.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Server is starting, or the database cannot be reached.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/server:
+    get:
+      tags: [server]
+      operationId: getServer
+      summary: Server name, version and enabled features
+      description: Needs authentication (any scope), because it reveals the version.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServerInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/session:
+    get:
+      tags: [auth]
+      operationId: getSession
+      summary: Current authentication state
+      description: |
+        Needs no authentication. With no credential it returns
+        `authenticated: false`. After a correct password, while the second
+        factor is still pending, it returns `authenticated: false` and
+        `twofa.pending: true` with the methods. `server` only carries
+        `name`, so an anonymous caller can render a login page without
+        learning the version.
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Log in with username and password (browser session)
+      description: |
+        Checks credentials with MeshCentral's own `authenticate` function.
+        That function applies the same lockout, invalid-login rate limits,
+        LDAP/other configured backends and password checks as the legacy
+        login. On success it sets the MeshCentral session cookie. If the user
+        has two-factor enabled, the server keeps the session in a pending
+        state and the client completes it with `/api/v1/auth/2fa`.
+        Needs `X-Outband: 1` and a valid Origin (the cookie CSRF rule
+        applies even before login).
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/XOutband'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: |
+            Either logged in (`authenticated: true`), or a second factor is
+            required (`authenticated: false, needs2fa: true`).
+          headers:
+            Set-Cookie:
+              description: MeshCentral session cookie (`xid`, `xid.sig`).
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: 'Wrong username or password (code `invalid_credentials`). The message never says which one was wrong.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/CsrfOrForbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/auth/2fa:
+    post:
+      tags: [auth]
+      operationId: loginSecondFactor
+      summary: Complete a pending login with a second factor
+      description: |
+        Checks the code with MeshCentral's existing 2FA logic (TOTP, backup
+        codes, email/SMS/messaging codes, YubiKey OTP). The `method` field is
+        optional; when it is missing the server tries the methods MeshCentral
+        accepts for a typed code. To have an email or SMS code sent, call
+        this once with `{"method": "email", "send": true}` and no token; the
+        server answers `202`. WebAuthn/FIDO keys are not supported by the v1
+        API; users with only a hardware key use `/legacy`.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/XOutband'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SecondFactorRequest' }
+      responses:
+        '200':
+          description: Logged in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginSuccess' }
+        '202':
+          description: Code sent through the requested method.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: 'Wrong code (`invalid_token`) or no pending login (`no_pending_login`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/CsrfOrForbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: End the browser session
+      description: Clears the MeshCentral session cookie. Succeeds even when the caller was not logged in.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/XOutband'
+      responses:
+        '204': { description: Logged out. }
+        '403': { $ref: '#/components/responses/CsrfOrForbidden' }
+
+  /api/v1/auth/tokens:
+    get:
+      tags: [auth]
+      operationId: listTokens
+      summary: List the caller's API tokens
+      description: Browser session only. Secrets are never returned.
+      security:
+        - cookieSession: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ApiToken' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [auth]
+      operationId: createToken
+      summary: Create an API token for the caller
+      description: |
+        Browser session only: a token cannot create tokens. The token acts as
+        the creating user, limited by its scopes. If the user's MeshCentral
+        rights shrink later, the token's power shrinks with them. The
+        `secret` appears in this response only. The server stores
+        `sha256(secret)`. A user can hold at most 50 live tokens.
+      security:
+        - cookieSession: []
+      parameters:
+        - $ref: '#/components/parameters/XOutband'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTokenRequest' }
+      responses:
+        '201':
+          description: Created. Store the secret now; it cannot be retrieved again.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreatedToken' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/CsrfOrForbidden' }
+        '409':
+          description: 'Token limit reached (`token_limit`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/auth/tokens/{tokenId}:
+    parameters:
+      - name: tokenId
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[A-Za-z0-9_-]{8,64}$' }
+    delete:
+      tags: [auth]
+      operationId: revokeToken
+      summary: Revoke one of the caller's tokens
+      description: |
+        Takes effect at once, including for open SSE streams that use the
+        token, which close within 5 seconds. The token record stays with
+        `revoked_at` set, for auditing.
+      security:
+        - cookieSession: []
+      parameters:
+        - $ref: '#/components/parameters/XOutband'
+      responses:
+        '204': { description: Revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/CsrfOrForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/groups:
+    get:
+      tags: [groups]
+      operationId: listGroups
+      summary: Device groups visible to the caller
+      description: Small enough to return whole (no pagination), as the legacy UI does.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Group' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/groups/{groupId}:
+    parameters:
+      - $ref: '#/components/parameters/GroupId'
+    get:
+      tags: [groups]
+      operationId: getGroup
+      summary: One device group
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Group' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/devices:
+    get:
+      tags: [devices]
+      operationId: listDevices
+      summary: Devices visible to the caller
+      parameters:
+        - name: group
+          in: query
+          description: Only devices in this group.
+          schema: { $ref: '#/components/schemas/Id' }
+        - name: status
+          in: query
+          description: |
+            `online` = the agent is connected; `offline` = no agent connection
+            (the device may still be reachable over AMT); `amt` = Intel AMT is
+            reachable (CIRA or local).
+          schema: { type: string, enum: [online, offline, amt] }
+        - name: q
+          in: query
+          description: Case-insensitive substring match on name or host name.
+          schema: { type: string, maxLength: 128 }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: OK, sorted by name.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Device' }
+                  next_cursor: { $ref: '#/components/schemas/NextCursor' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/devices/{deviceId}:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    get:
+      tags: [devices]
+      operationId: getDevice
+      summary: Device detail
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/devices/{deviceId}/power:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    post:
+      tags: [power]
+      operationId: powerAction
+      summary: Perform a power action
+      description: |
+        The server picks the path in this order:
+        * `on` and `cycle`: Intel AMT only.
+        * `off` and `reset`: the agent if it is connected, else Intel AMT.
+        * `sleep`: the agent only.
+        * `wake`: Wake-on-LAN through peer agents, plus AMT power-up if AMT
+          is reachable. The same dispatch as MeshCentral's `wakedevices`.
+        * Devices in IP-KVM/PDU groups use the port operation. MQTT devices
+          also get the MQTT power message, as in MeshCentral.
+
+        MeshCentral power commands do not wait for the device. The response
+        means the command was dispatched, not that it finished. The resulting
+        state change arrives as a `device.power` stream event and in the
+        device's `power` field. Scope `power` is required; see the rights
+        table in the API description.
+      parameters:
+        - $ref: '#/components/parameters/XOutband'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PowerRequest' }
+      responses:
+        '202':
+          description: Dispatched.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PowerResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/CsrfOrForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            No path can carry this action right now (`not_reachable`), for
+            example `sleep` while the agent is offline, or `on` while AMT is
+            not reachable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/devices/{deviceId}/events:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    get:
+      tags: [events]
+      operationId: listDeviceEvents
+      summary: Events for one device (newest first)
+      parameters:
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/Until'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/devices/{deviceId}/console/{kind}/ticket:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+      - $ref: '#/components/parameters/ConsoleKind'
+    post:
+      tags: [console]
+      operationId: createConsoleTicket
+      summary: Get a single-use ticket to open a console WebSocket
+      description: |
+        Checks the `console` scope and the rights for `kind` (see the rights
+        table), then returns a random ticket. The ticket is bound to this
+        user, device, kind and credential. It lasts 60 seconds and works
+        once. Revoking the token or logging out makes unused tickets
+        invalid. Opening the console is audited.
+
+        **WebSocket:** `GET /api/v1/devices/{deviceId}/console/{kind}?ticket=...`
+        with `Upgrade: websocket`. The WebSocket also needs a valid `Origin`
+        unless the ticket was issued to a bearer token. Frames:
+        * `sol`: binary frames carry raw terminal bytes in both directions
+          (VT100/ANSI from the managed host's serial console). Text frames
+          carry JSON control messages: `{"type":"state","state":"connecting|open|closed","reason":...}`
+          from the server, and `{"type":"resize","cols":N,"rows":N}` from the
+          client (ignored for SOL).
+        * `terminal` (later): the same framing, backed by the agent's shell
+          relay.
+        Close codes: 4401 bad or expired ticket, 4403 rights changed, 4409
+        device not reachable, 1011 server error. The server proxies the
+        stream through MeshCentral's existing relay (AMT redirection for
+        SOL), so AMT credentials never leave the server.
+      parameters:
+        - $ref: '#/components/parameters/XOutband'
+      responses:
+        '201':
+          description: Ticket created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConsoleTicket' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/CsrfOrForbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: 'Console kind not available on this device (`not_reachable` or `not_supported`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/events:
+    get:
+      tags: [events]
+      operationId: listEvents
+      summary: Event and audit log (newest first)
+      description: |
+        Returns the events the caller may see: events about groups and
+        devices the caller has rights on, plus the caller's own user events.
+        `LIMITEVENTS` narrows a group to the caller's own events, as in
+        MeshCentral. Callers with the site right `ALLEVENTS` see every event
+        in the domain.
+      parameters:
+        - name: device
+          in: query
+          schema: { $ref: '#/components/schemas/Id' }
+        - name: group
+          in: query
+          schema: { $ref: '#/components/schemas/Id' }
+        - name: type
+          in: query
+          description: MeshCentral event type (`etype`), such as `node`, `mesh`, `user`.
+          schema: { type: string, maxLength: 32 }
+        - name: audit
+          in: query
+          description: If true, only events from state-changing API or UI actions (those that have a user).
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/Until'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/stream:
+    get:
+      tags: [stream]
+      operationId: stream
+      summary: Live updates (Server-Sent Events)
+      description: |
+        A `text/event-stream` response. Browsers use `EventSource` with the
+        session cookie. Machine clients send `Authorization: Bearer`. Each
+        message has `event:` set to one of the types below, `id:` set to a
+        stream sequence number, and `data:` set to a JSON `StreamEvent`. The
+        server sends a `: ping` comment every 25 seconds.
+
+        Event types:
+        * `ready`: the first message. Data `{"type":"ready","data":{"server_time":...}}`.
+        * `device.updated`: a device's fields changed (name, OS, IPs,
+          connectivity, AMT). Data is the full `Device`.
+        * `device.power`: the power state changed. Data `{id, power}`.
+        * `device.removed`: the device was deleted or is no longer visible.
+          Data `{id}`.
+        * `event.created`: a new log event the caller may see. Data is an `Event`.
+
+        Each event passes the same visibility checks as the REST endpoints,
+        at the moment it is sent. `Last-Event-ID` resume works on a best-effort
+        basis for the last 5 minutes. On a gap the server sends `resync`, and
+        the client should refetch `/api/v1/devices`. The server closes the
+        stream when the credential ends (logout, expiry, revocation).
+      parameters:
+        - name: types
+          in: query
+          description: Comma-separated event types to receive (default all).
+          schema: { type: string, example: 'device.power,event.created' }
+        - name: Last-Event-ID
+          in: header
+          schema: { type: string }
+      responses:
+        '200':
+          description: Event stream.
+          content:
+            text/event-stream:
+              schema: { $ref: '#/components/schemas/StreamEvent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+components:
+  securitySchemes:
+    cookieSession:
+      type: apiKey
+      in: cookie
+      name: xid
+      description: |
+        MeshCentral's signed cookie-session (`xid` + `xid.sig`). Non-GET
+        requests need `X-Outband: 1` and a valid Origin.
+    bearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: 'obt_<43 base64url chars>'
+      description: API token from `POST /api/v1/auth/tokens`.
+
+  parameters:
+    XOutband:
+      name: X-Outband
+      in: header
+      description: CSRF guard. Required for cookie-authenticated requests that are not GET/HEAD.
+      required: false
+      schema: { type: string, const: '1' }
+    DeviceId:
+      name: deviceId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    GroupId:
+      name: groupId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    ConsoleKind:
+      name: kind
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/ConsoleKind' }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string, maxLength: 512 }
+    Since:
+      name: since
+      in: query
+      description: Only events at or after this time.
+      schema: { type: string, format: date-time }
+    Until:
+      name: until
+      in: query
+      description: Only events before this time.
+      schema: { type: string, format: date-time }
+
+  responses:
+    BadRequest:
+      description: 'Malformed request (`invalid_request`). `details` names the bad fields.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: 'No valid credential (`unauthenticated`), or an expired/revoked token (`token_expired`, `token_revoked`).'
+      headers:
+        WWW-Authenticate:
+          schema: { type: string, example: 'Bearer realm="outband"' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    CsrfOrForbidden:
+      description: 'Missing `X-Outband` header or bad Origin (`csrf_failed`), missing scope (`insufficient_scope`), or missing MeshCentral right (`forbidden`).'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: 'No such resource, or the caller cannot see it (`not_found`).'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: 'Too many requests (`rate_limited`) or a locked-out login (`locked_out`).'
+      headers:
+        Retry-After:
+          schema: { type: integer, description: Seconds. }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Id:
+      type: string
+      description: Last segment of a MeshCentral id (base64 using `@` and `$`).
+      pattern: '^[A-Za-z0-9@$_-]{8,128}$'
+      examples: ['Hz3$g7aJr0hYpmQ2kV5b@Xq1sTn9cWfE8uLdPoZiRyM4xNvBjKe6tAlGw2HsDcF7']
+
+    NextCursor:
+      type: [string, 'null']
+      description: Pass as `cursor` for the next page; `null` on the last page.
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable code.
+              enum:
+                - invalid_request
+                - unauthenticated
+                - invalid_credentials
+                - invalid_token
+                - no_pending_login
+                - token_expired
+                - token_revoked
+                - token_limit
+                - csrf_failed
+                - insufficient_scope
+                - forbidden
+                - not_found
+                - not_reachable
+                - not_supported
+                - rate_limited
+                - locked_out
+                - internal
+            message: { type: string }
+            details:
+              type: object
+              additionalProperties: true
+              description: Extra context, such as `{"field":"action"}` or `{"required_scope":"power"}`.
+            request_id:
+              type: string
+              description: Matches the `Outband-Request-Id` response header and the server log.
+      examples:
+        - error: { code: not_found, message: Device not found, request_id: 01HF7Z3K9Q }
+
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, starting, degraded] }
+
+    ServerInfo:
+      type: object
+      required: [name, version, outband_version, api_version, features]
+      properties:
+        name: { type: string, description: Domain title or server name. }
+        version: { type: string, description: 'MeshCentral core version, such as `1.3.1`.' }
+        outband_version: { type: string }
+        api_version: { type: string, examples: ['1.0.0-draft.1'] }
+        features:
+          type: object
+          required: [amt, twofa, api_tokens, console_kinds, legacy_ui]
+          properties:
+            amt: { type: boolean, description: Intel AMT management is enabled. }
+            twofa: { type: boolean, description: 2FA is available in this domain. }
+            api_tokens: { type: boolean }
+            console_kinds:
+              type: array
+              items: { $ref: '#/components/schemas/ConsoleKind' }
+            legacy_ui: { type: boolean, description: '`/legacy` is served.' }
+
+    User:
+      type: object
+      required: [id, name, siteadmin]
+      properties:
+        id: { type: string, description: 'MeshCentral user id (`user/<domain>/<name>`).' }
+        name: { type: string }
+        email: { type: [string, 'null'] }
+        siteadmin:
+          type: integer
+          description: MeshCentral `SITERIGHT_*` bitmask (`4294967295` = full admin).
+
+    Session:
+      type: object
+      required: [authenticated, user, server, twofa]
+      properties:
+        authenticated: { type: boolean }
+        user:
+          oneOf:
+            - $ref: '#/components/schemas/User'
+            - type: 'null'
+        auth_method:
+          type: [string, 'null']
+          enum: [cookie, token, null]
+        scopes:
+          type: array
+          items: { $ref: '#/components/schemas/Scope' }
+        server:
+          type: object
+          required: [name]
+          properties:
+            name: { type: string }
+            version: { type: string, description: Only present when authenticated. }
+        twofa:
+          type: object
+          required: [required]
+          properties:
+            required: { type: boolean, description: A password was accepted and a second factor is pending. }
+            methods:
+              type: array
+              items: { $ref: '#/components/schemas/TwoFactorMethod' }
+
+    TwoFactorMethod:
+      type: string
+      enum: [otp, backup, email, sms, messaging, yubikey]
+      description: '`otp` = authenticator app (TOTP).'
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      additionalProperties: false
+      properties:
+        username: { type: string, minLength: 1, maxLength: 256 }
+        password: { type: string, minLength: 1, maxLength: 1024, writeOnly: true }
+
+    LoginSuccess:
+      type: object
+      required: [authenticated, user]
+      properties:
+        authenticated: { const: true }
+        user: { $ref: '#/components/schemas/User' }
+
+    LoginNeeds2fa:
+      type: object
+      required: [authenticated, needs2fa, methods]
+      properties:
+        authenticated: { const: false }
+        needs2fa: { const: true }
+        methods:
+          type: array
+          items: { $ref: '#/components/schemas/TwoFactorMethod' }
+
+    LoginResult:
+      oneOf:
+        - $ref: '#/components/schemas/LoginSuccess'
+        - $ref: '#/components/schemas/LoginNeeds2fa'
+
+    SecondFactorRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        token: { type: string, minLength: 4, maxLength: 64, writeOnly: true, description: The code. }
+        method: { $ref: '#/components/schemas/TwoFactorMethod' }
+        send: { type: boolean, description: 'Ask the server to send a code (`email`, `sms`, `messaging`).' }
+
+    Scope:
+      type: string
+      enum: [read, power, console]
+
+    ApiToken:
+      type: object
+      required: [id, name, scopes, created_at, expires_at, last_used_at, revoked_at, prefix]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        prefix: { type: string, description: 'First 8 characters of the secret (e.g. `obt_k3Jx`), to help identify it.' }
+        scopes:
+          type: array
+          items: { $ref: '#/components/schemas/Scope' }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        last_used_at: { type: [string, 'null'], format: date-time }
+        revoked_at: { type: [string, 'null'], format: date-time }
+
+    CreateTokenRequest:
+      type: object
+      required: [name, scopes]
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 64, pattern: '^[\x20-\x7E]+$' }
+        scopes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/Scope' }
+        expires_in_days:
+          type: integer
+          minimum: 1
+          maximum: 365
+          default: 90
+
+    CreatedToken:
+      type: object
+      required: [token, secret]
+      properties:
+        token: { $ref: '#/components/schemas/ApiToken' }
+        secret:
+          type: string
+          description: "Shown once. Send it as `Authorization: Bearer <secret>`."
+          pattern: '^obt_[A-Za-z0-9_-]{43}$'
+
+    Group:
+      type: object
+      required: [id, name, kind, description, rights, device_count]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        name: { type: string }
+        description: { type: string }
+        kind:
+          type: string
+          enum: [amt, agent, local, ipkvm]
+          description: 'MeshCentral `mtype`: 1 = amt (AMT-only), 2 = agent, 3 = local (no agent), 4 = ipkvm.'
+        rights:
+          $ref: '#/components/schemas/Rights'
+        device_count: { type: integer, minimum: 0 }
+
+    Rights:
+      type: object
+      description: The caller's effective MeshCentral rights on a group or device.
+      required: [mask, names]
+      properties:
+        mask:
+          type: integer
+          description: Raw `MESHRIGHT_*` bitmask (`4294967295` = full).
+        names:
+          type: array
+          description: Decoded names of the bits set, lower-case (`remotecontrol`, `wakedevice`, `resetoff`, `noamt`, ...), or `["admin"]` for full rights.
+          items: { type: string }
+
+    ConsoleKind:
+      type: string
+      enum: [sol, terminal]
+      description: '`sol` = Intel AMT Serial-over-LAN. `terminal` = agent shell (not yet available).'
+
+    PowerAction:
+      type: string
+      enum: [on, off, reset, cycle, sleep, wake]
+
+    PowerState:
+      type: string
+      enum: [on, sleep, hibernate, soft_off, off, present, unknown]
+      description: |
+        From MeshCentral `pwr`: 1 = on (S0), 2-4 = sleep (S1-S3),
+        5 = hibernate (S4), 6 = soft_off (S5), 7 = present (seen, state not
+        known), 8 = off, 0 or missing = unknown.
+
+    Device:
+      type: object
+      required: [id, name, group, os, ips, online, connectivity, amt, power, last_seen, capabilities]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        name: { type: string }
+        host: { type: [string, 'null'], description: Host name or address MeshCentral uses for the device. }
+        group:
+          type: object
+          required: [id, name]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            name: { type: string }
+        os: { type: [string, 'null'], description: OS description as the agent reports it. }
+        ips:
+          type: array
+          description: IP addresses the agent or AMT reported.
+          items: { type: string }
+        online: { type: boolean, description: The MeshAgent is connected. }
+        connectivity:
+          type: object
+          description: 'MeshCentral `conn` bits: 1 agent, 2 AMT CIRA, 4 AMT local, 8 relay, 16 MQTT.'
+          required: [agent, amt_cira, amt_local, relay, mqtt]
+          properties:
+            agent: { type: boolean }
+            amt_cira: { type: boolean }
+            amt_local: { type: boolean }
+            relay: { type: boolean }
+            mqtt: { type: boolean }
+        amt:
+          type: object
+          required: [state, version, reachable]
+          properties:
+            state:
+              type: string
+              enum: [none, unprovisioned, provisioning, provisioned, unknown]
+              description: 'From `intelamt.state` (0 = unprovisioned, 1 = provisioning, 2 = provisioned); `none` = no Intel AMT detected.'
+            version: { type: [string, 'null'], examples: ['16.1.25'] }
+            reachable: { type: boolean, description: The server can reach AMT now (CIRA or local). }
+        power:
+          type: object
+          required: [state, since]
+          properties:
+            state: { $ref: '#/components/schemas/PowerState' }
+            since: { type: [string, 'null'], format: date-time, description: When this state was last seen to start. }
+        last_seen:
+          type: [string, 'null']
+          format: date-time
+          description: Last agent or AMT connection time; the current time while connected.
+        capabilities:
+          type: object
+          description: What the caller can do now, given rights, scope and reachability.
+          required: [power, console]
+          properties:
+            power:
+              type: array
+              items: { $ref: '#/components/schemas/PowerAction' }
+            console:
+              type: array
+              items: { $ref: '#/components/schemas/ConsoleKind' }
+
+    DeviceDetail:
+      allOf:
+        - $ref: '#/components/schemas/Device'
+        - type: object
+          required: [rights]
+          properties:
+            rights: { $ref: '#/components/schemas/Rights' }
+            description: { type: [string, 'null'] }
+            tags:
+              type: array
+              items: { type: string }
+            agent:
+              type: [object, 'null']
+              properties:
+                version: { type: [string, 'null'] }
+                type: { type: [integer, 'null'], description: MeshCentral agent type id. }
+                connected_at: { type: [string, 'null'], format: date-time }
+            hardware:
+              type: [object, 'null']
+              description: Summary from MeshCentral's hardware inventory, when reported.
+              properties:
+                manufacturer: { type: [string, 'null'] }
+                model: { type: [string, 'null'] }
+                serial: { type: [string, 'null'] }
+                cpu: { type: [string, 'null'] }
+                memory_mb: { type: [integer, 'null'] }
+
+    PowerRequest:
+      type: object
+      required: [action]
+      additionalProperties: false
+      properties:
+        action: { $ref: '#/components/schemas/PowerAction' }
+
+    PowerResult:
+      type: object
+      required: [device_id, action, via, status]
+      properties:
+        device_id: { $ref: '#/components/schemas/Id' }
+        action: { $ref: '#/components/schemas/PowerAction' }
+        via:
+          type: array
+          description: Paths the command went out on.
+          items: { type: string, enum: [agent, amt, wol, mqtt, ipkvm] }
+        status: { type: string, enum: [dispatched] }
+        event_id: { type: [string, 'null'], description: The audit event written for this action. }
+
+    ConsoleTicket:
+      type: object
+      required: [ticket, url, expires_at]
+      properties:
+        ticket: { type: string, description: Single use. Do not log it. }
+        url: { type: string, description: 'Relative WebSocket URL with the ticket, e.g. `/api/v1/devices/{id}/console/sol?ticket=...`.' }
+        expires_at: { type: string, format: date-time }
+
+    Event:
+      type: object
+      required: [id, time, type, action, message]
+      properties:
+        id: { type: string }
+        time: { type: string, format: date-time }
+        type: { type: string, description: 'MeshCentral `etype` (`node`, `mesh`, `user`, `server`, ...).' }
+        action: { type: string, description: 'MeshCentral event action, such as `poweraction`, `login`, `outband.token.create`.' }
+        message: { type: string, description: The event's human-readable message. }
+        user:
+          type: [object, 'null']
+          properties:
+            id: { type: string }
+            name: { type: string }
+        token_name: { type: [string, 'null'], description: Set when an API token caused the event. }
+        device_id:
+          oneOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }]
+        group_id:
+          oneOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }]
+        source_ip: { type: [string, 'null'], description: Shown only to site admins. }
+
+    EventPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Event' }
+        next_cursor: { $ref: '#/components/schemas/NextCursor' }
+
+    StreamEvent:
+      type: object
+      required: [type, data]
+      properties:
+        type:
+          type: string
+          enum: [ready, device.updated, device.power, device.removed, event.created, resync]
+        data:
+          description: Depends on `type` (see `/api/v1/stream`).
+          oneOf:
+            - $ref: '#/components/schemas/Device'
+            - $ref: '#/components/schemas/Event'
+            - type: object
+              additionalProperties: true
