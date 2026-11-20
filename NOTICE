@@ -15,7 +15,7 @@ format has no comments:
   - package.json, package-lock.json (scripts, development dependencies,
     repository URL)
   - .gitignore, .dockerignore (test data directory)
-  - .github/workflows: upstream release and image workflows moved to
+  - .github/workflows: upstream release, image, CodeQL and housekeeping workflows moved to
     .github/upstream-workflows-disabled/ so they do not run in this fork
 
 New files under outband/, api/, test/outband/, scripts/ and

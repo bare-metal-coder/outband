@@ -10,6 +10,7 @@
  *   _id 'evt_…', time (ms), domain, type ('user'|'node'|'mesh'|'server'),
  *   action ('outband.login', …), outcome ('success'|'denied'|'failed'),
  *   user (full user id or null), user_name, token_id, token_name,
+ *   subject (full id of another user the event is about, e.g. a token owner),
  *   device_id, group_id (full ids or null), action_id, source_ip,
  *   reason, params (typed template parameters), count
  * @license Apache-2.0
@@ -17,7 +18,7 @@
 
 'use strict';
 
-const { randomId, truncateIp } = require('./util');
+const { randomId, truncateIp, ApiError } = require('./util');
 
 /** Message templates by action. Parameters are typed; free text is never passed through. */
 const TEMPLATES = {
@@ -54,7 +55,7 @@ class Audit {
         const doc = {
             _id: randomId('evt_', 12), time: Date.now(), domain: e.domain || '',
             type: e.type || 'user', action: e.action, outcome: e.outcome || 'success',
-            user: e.user || null, user_name: e.userName || null,
+            user: e.user || null, user_name: e.userName || null, subject: e.subject || null,
             token_id: e.tokenId || null, token_name: e.tokenName || null,
             device_id: e.deviceId || null, group_id: e.groupId || null,
             action_id: e.actionId || null, source_ip: e.ip || null,
@@ -74,7 +75,7 @@ class Audit {
             this.store.audit.update({ _id: hit.id }, { $set: { count: hit.count } }).catch(function () { });
             return;
         }
-        if (this.agg.size > 10000) { for (const key of this.agg.keys()) { if (!key.endsWith('|' + minute)) this.agg.delete(key); } if (this.agg.size > 10000) this.agg.clear(); }
+        if (this.agg.size > 10000) { for (const key of this.agg.keys()) { if ((this.agg.size <= 10000) && key.endsWith('|' + minute)) break; this.agg.delete(key); } }
         const doc = await this.write(Object.assign({}, e, { outcome: 'denied' }));
         this.agg.set(k, { id: doc._id, count: 1 });
     }
@@ -85,18 +86,31 @@ class Audit {
         return this.store.audit.remove({ time: { $lt: cutoff } }).catch(function () { });
     }
 
-    /** Erasure: keep events, replace the name, pseudonymize the id, truncate source_ip. */
+    /**
+     * Erasure: keep the events, but in every event by or about the user
+     * replace the name, pseudonymize the ids, drop token names and truncate
+     * source_ip.
+     */
     async eraseUser(userid, pseudonym) {
-        const docs = await this.store.audit.find({ user: userid });
+        const short = userid.split('/').slice(2).join('/');
+        const docs = await this.store.audit.find({ $or: [{ user: userid }, { subject: userid }] });
         for (const d of docs) {
-            await this.store.audit.update({ _id: d._id }, { $set: { user: pseudonym, user_name: 'deleted user', erased: true, source_ip: truncateIp(d.source_ip) } }).catch(function () { });
+            const set = { erased: true, token_name: null, source_ip: truncateIp(d.source_ip) };
+            if (d.user == userid) { set.user = pseudonym; set.user_name = 'deleted user'; }
+            if (d.subject == userid) { set.subject = pseudonym; }
+            if (d.params && (d.params.owner == short)) { set['params.owner'] = pseudonym; }
+            await this.store.audit.update({ _id: d._id }, { $set: set }).catch(function () { });
         }
     }
 
     /** Query helper for event endpoints: newest first, paged by (time, _id). */
     async find(query, limit, cursor) {
-        const q = Object.assign({}, query);
-        if (cursor != null) { q.$or = [{ time: { $lt: cursor.t } }, { time: cursor.t, _id: { $lt: cursor.i } }]; }
+        const parts = [Object.assign({}, query)];
+        if (cursor != null) {
+            if ((typeof cursor.t != 'number') || !Number.isFinite(cursor.t) || (typeof cursor.i != 'string') || (cursor.i.length > 64)) throw new ApiError(400, 'invalid_request', 'Invalid cursor', { field: 'cursor' });
+            parts.push({ $or: [{ time: { $lt: cursor.t } }, { time: cursor.t, _id: { $lt: cursor.i } }] });
+        }
+        const q = (parts.length == 1) ? parts[0] : { $and: parts };
         const docs = await this.store.audit.find(q, { sort: { time: -1, _id: -1 }, limit: limit + 1 });
         const more = docs.length > limit;
         const items = docs.slice(0, limit);

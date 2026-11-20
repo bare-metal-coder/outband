@@ -78,12 +78,18 @@ class SessionRecords {
         return this.isValid(session.userid, session.x);
     }
 
-    /** Auth-cookie check: cookies derived from a session stop working when it expires. */
-    checkAuthCookie(cookie) {
-        if ((cookie == null) || (cookie.x == null)) return true; // not derived from a web session
+    /**
+     * Auth-cookie check: cookies derived from a session stop working when it
+     * expires or is revoked. With `sessionRequired`, a cookie must carry a
+     * session id (it is accepted only from a live session).
+     */
+    checkAuthCookie(cookie, sessionRequired) {
+        if (cookie == null) return false;
+        if (cookie.x == null) return !sessionRequired; // not derived from a web session (agent-side and tool cookies)
         const userid = (typeof cookie.userid == 'string') ? cookie.userid : cookie.ruserid;
-        if (typeof userid != 'string') return false;
-        return this.isValid(userid, String(cookie.x));
+        if ((typeof userid != 'string') || (typeof cookie.x != 'string')) return false;
+        if (this.webserver && this.webserver.destroyedSessions && (this.webserver.destroyedSessions[userid + '/' + cookie.x] != null)) return false;
+        return this.isValid(userid, cookie.x);
     }
 
     /** Written by the login handler after a real check. */

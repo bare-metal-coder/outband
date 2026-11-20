@@ -4,6 +4,7 @@
 * @copyright Intel Corporation 2018-2022
 * @license Apache-2.0
 * @version v0.0.1
+* Modified by the Outband project (see NOTICE)
 */
 
 /*jslint node: true */
@@ -6973,7 +6974,7 @@ module.exports.CreateMeshUser = function (parent, db, ws, req, args, domain, use
             if ((node == null) || ((rights & MESHRIGHT_REMOTECONTROL) == 0) || (visible == false)) return; // Access denied.
 
             // Add a user authentication cookie to a url
-            var cookieContent = { userid: user._id, domainid: user.domain };
+            var cookieContent = { userid: user._id, domainid: user.domain, x: req.session.x }; // Outband: bound to the session
             if (command.nodeid) { cookieContent.nodeid = command.nodeid; }
             if (command.tcpaddr) { cookieContent.tcpaddr = command.tcpaddr; } // Indicates the browser want the agent to TCP connect to a remote address
             if (command.tcpport) { cookieContent.tcpport = command.tcpport; } // Indicates the browser want the agent to TCP connect to a remote port

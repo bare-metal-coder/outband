@@ -113,12 +113,11 @@ function plan(env, action, via) {
         return [via];
     }
     const d = defaultPaths(action, env.groupKind);
-    const reachablePrimary = d.anyOf.filter(function (p) { return usable(env, action, p); });
-    if (reachablePrimary.length > 0) {
-        const allowedPrimary = reachablePrimary.filter(function (p) { return env.allowed(p, action); });
-        if (allowedPrimary.length == 0) throw new ApiError(403, 'forbidden', 'Not allowed on this path', { path: reachablePrimary[0] });
-        return defaultNow(env, action);
-    }
+    // Rights first: no reachability or path details for a caller without the right.
+    const allowedDefault = d.anyOf.filter(function (p) { return env.allowed(p, action); });
+    if ((d.anyOf.length > 0) && (allowedDefault.length == 0)) throw new ApiError(403, 'forbidden', 'Not allowed on this path', { path: d.anyOf[0] });
+    if ((d.anyOf.length == 0) && (viaNow(env, action).length == 0) && !VIA_ALLOWED[action].some(function (p) { return env.allowed(p, action); })) throw new ApiError(403, 'forbidden', 'Not allowed');
+    if (allowedDefault.some(function (p) { return usable(env, action, p); })) return defaultNow(env, action);
     throw new ApiError(409, 'not_reachable', 'The default path cannot carry the action now', { path: d.anyOf[0] || null, available_paths: viaNow(env, action) });
 }
 

@@ -1,22 +1,36 @@
 /**
  * @description Outband API: in-memory rate limiters with a size cap.
+ *
+ * When a table is full, expired entries are dropped first, then the oldest
+ * entries that are not locked. Locked entries are never evicted, and the
+ * tables are never cleared wholesale.
  * @license Apache-2.0
  */
 
 'use strict';
 
-const MAX_KEYS = 100000;
+const DEFAULT_MAX_KEYS = 100000;
 
 /** Fixed-window counter: `limit` hits per `windowMs`. */
 class WindowLimiter {
-    constructor(limit, windowMs) { this.limit = limit; this.windowMs = windowMs; this.map = new Map(); }
+    constructor(limit, windowMs, maxKeys) { this.limit = limit; this.windowMs = windowMs; this.maxKeys = maxKeys || DEFAULT_MAX_KEYS; this.map = new Map(); }
+
+    _evict(now) {
+        for (const [k, e] of this.map) { if (e.reset <= now) this.map.delete(k); }
+        // Oldest first (Map keeps insertion order); an entry over its limit counts as locked.
+        for (const [k, e] of this.map) {
+            if (this.map.size < this.maxKeys) break;
+            if (e.count <= this.limit) this.map.delete(k);
+        }
+    }
 
     _entry(key, now) {
         let e = this.map.get(key);
         if ((e == null) || (e.reset <= now)) {
-            if (this.map.size >= MAX_KEYS) { this.prune(now); if (this.map.size >= MAX_KEYS) { this.map.clear(); } }
+            if (e != null) this.map.delete(key);
+            if (this.map.size >= this.maxKeys) { this._evict(now); }
             e = { count: 0, reset: now + this.windowMs };
-            this.map.set(key, e);
+            if (this.map.size < this.maxKeys) this.map.set(key, e);
         }
         return e;
     }
@@ -30,14 +44,6 @@ class WindowLimiter {
         return { allowed: allowed, limit: this.limit, remaining: Math.max(0, this.limit - e.count), resetSec: Math.max(1, Math.ceil((e.reset - now) / 1000)) };
     }
 
-    /** Look without counting. */
-    peek(key) {
-        const now = Date.now();
-        const e = this.map.get(key);
-        if ((e == null) || (e.reset <= now)) return { allowed: true, limit: this.limit, remaining: this.limit, resetSec: Math.ceil(this.windowMs / 1000) };
-        return { allowed: e.count < this.limit, limit: this.limit, remaining: Math.max(0, this.limit - e.count), resetSec: Math.max(1, Math.ceil((e.reset - now) / 1000)) };
-    }
-
     prune(now) { for (const [k, e] of this.map) { if (e.reset <= now) this.map.delete(k); } }
 }
 
@@ -47,7 +53,7 @@ class WindowLimiter {
  * second-factor counter and the invalid-bearer limiter.
  */
 class FailureLock {
-    constructor(max, windowMs, lockMs) { this.max = max; this.windowMs = windowMs; this.lockMs = lockMs; this.map = new Map(); }
+    constructor(max, windowMs, lockMs, maxKeys) { this.max = max; this.windowMs = windowMs; this.lockMs = lockMs; this.maxKeys = maxKeys || DEFAULT_MAX_KEYS; this.map = new Map(); }
 
     /** Seconds left on a lock, or 0. */
     lockedFor(key) {
@@ -58,22 +64,38 @@ class FailureLock {
         return Math.ceil(left / 1000);
     }
 
+    _locked(e, now) { return (e.lockedUntil != null) && (e.lockedUntil > now); }
+
+    /** Drop stale entries, then the oldest unlocked ones. Never a locked entry. */
+    _evict(now) {
+        this.prune(now);
+        for (const [k, e] of this.map) {
+            if (this.map.size < this.maxKeys) break;
+            if (!this._locked(e, now)) this.map.delete(k);
+        }
+    }
+
     fail(key) {
         const now = Date.now();
-        if (this.map.size >= MAX_KEYS) { this.prune(now); if (this.map.size >= MAX_KEYS) { this.map.clear(); } }
         let e = this.map.get(key);
-        if (e == null) { e = { times: [], lockedUntil: null }; this.map.set(key, e); }
-        if ((e.lockedUntil != null) && (e.lockedUntil > now)) return;
+        if (e == null) {
+            if (this.map.size >= this.maxKeys) this._evict(now);
+            if (this.map.size >= this.maxKeys) return; // every entry is locked: do not track more keys
+            e = { times: [], lockedUntil: null };
+            this.map.set(key, e);
+        }
+        if (this._locked(e, now)) return;
+        e.lockedUntil = null;
         e.times = e.times.filter(function (t) { return t > now - this.windowMs; }, this);
         e.times.push(now);
         if (e.times.length >= this.max) { e.lockedUntil = now + this.lockMs; e.times = []; }
     }
 
-    reset(key) { this.map.delete(key); }
+    reset(key) { const e = this.map.get(key); if ((e != null) && !this._locked(e, Date.now())) this.map.delete(key); }
 
     prune(now) {
         for (const [k, e] of this.map) {
-            if ((e.lockedUntil != null) && (e.lockedUntil > now)) continue;
+            if (this._locked(e, now)) continue;
             if ((e.times.length == 0) || (e.times[e.times.length - 1] <= now - this.windowMs)) this.map.delete(k);
         }
     }

@@ -74,16 +74,24 @@ class Tokens {
         this.store.tokens.update({ _id: doc._id }, { $set: { last_used: now } }).catch(function () { });
     }
 
+    /** Revoke a token. `reason`: 'revoked' (owner or admin), 'credentials_changed', 'user_deleted'. */
     async revoke(doc, byUserId, reason) {
         if (doc.revoked == null) {
             const now = Date.now();
-            await this.store.tokens.update({ _id: doc._id }, { $set: { revoked: now, revoked_by: byUserId } });
-            doc.revoked = now;
+            await this.store.tokens.update({ _id: doc._id }, { $set: { revoked: now, revoked_by: byUserId || null, revoked_reason: reason || 'revoked' } });
+            doc.revoked = now; doc.revoked_reason = reason || 'revoked';
         }
         this.bus.emit('token-ended', { tokenId: doc._id, reason: reason || 'revoked' });
     }
 
     /** Delete every token of a user (erasure). */
+    /** Revoke every live token of a user created before `notBefore`. */
+    async revokeIssuedBefore(userid, notBefore, reason) {
+        const docs = await this.store.tokens.find({ owner: userid, revoked: null, created: { $lt: notBefore } });
+        for (const d of docs) { await this.revoke(d, null, reason); }
+        return docs.length;
+    }
+
     async removeUser(userid) {
         const docs = await this.store.tokens.find({ owner: userid });
         await this.store.tokens.remove({ owner: userid });
@@ -96,11 +104,12 @@ class Tokens {
      * @param {{limit: number, cursor: object|null}} page
      */
     async list(query, page) {
-        const q = Object.assign({}, query);
+        const parts = [Object.assign({}, query)];
         if (page.cursor != null) {
-            if ((typeof page.cursor.c != 'number') || (typeof page.cursor.i != 'string')) { throw new ApiError(400, 'invalid_request', 'Invalid cursor', { field: 'cursor' }); }
-            q.$or = [{ created: { $lt: page.cursor.c } }, { created: page.cursor.c, _id: { $lt: page.cursor.i } }];
+            if ((typeof page.cursor.c != 'number') || !Number.isFinite(page.cursor.c) || (typeof page.cursor.i != 'string') || (page.cursor.i.length > 64)) { throw new ApiError(400, 'invalid_request', 'Invalid cursor', { field: 'cursor' }); }
+            parts.push({ $or: [{ created: { $lt: page.cursor.c } }, { created: page.cursor.c, _id: { $lt: page.cursor.i } }] });
         }
+        const q = (parts.length == 1) ? parts[0] : { $and: parts };
         const docs = await this.store.tokens.find(q, { sort: { created: -1, _id: -1 }, limit: page.limit + 1 });
         const more = docs.length > page.limit;
         const items = docs.slice(0, page.limit);

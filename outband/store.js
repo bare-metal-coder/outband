@@ -2,10 +2,11 @@
  * @description Outband API: persistent store.
  *
  * Outband keeps its records (session records, the revocation list, API
- * tokens, audit events, runtime settings, idempotency keys) in its own
+ * tokens, audit events, runtime settings, idempotency keys, per-user
+ * not_before) in its own
  * collections, separate from MeshCentral's database and its event expiry.
  * This implementation uses NeDB files in the MeshCentral data directory
- * (`outband-<name>.db`), or memory only for tests.
+ * (`outband-<name>.db`, mode 0600), or memory only for tests.
  * @license Apache-2.0
  */
 
@@ -14,7 +15,9 @@
 const path = require('path');
 const Datastore = require('@seald-io/nedb');
 
-const COLLECTIONS = ['sessions', 'revocations', 'tokens', 'audit', 'settings', 'idempotency'];
+const COLLECTIONS = ['sessions', 'revocations', 'tokens', 'audit', 'settings', 'idempotency', 'userstate'];
+/** Files are readable by the server account only. */
+const MODES = { fileMode: 0o600, dirMode: 0o700 };
 
 class Collection {
     constructor(ds) { this.ds = ds; }
@@ -39,7 +42,7 @@ class Collection {
 async function openStore(options) {
     const store = {};
     for (const name of COLLECTIONS) {
-        const opts = options.inMemory ? { inMemoryOnly: true } : { filename: path.join(options.dir, 'outband-' + name + '.db') };
+        const opts = options.inMemory ? { inMemoryOnly: true } : { filename: path.join(options.dir, 'outband-' + name + '.db'), modes: MODES };
         const ds = new Datastore(opts);
         await ds.loadDatabaseAsync();
         if (!options.inMemory) { ds.setAutocompactionInterval(3600000); }
@@ -49,8 +52,9 @@ async function openStore(options) {
     await store.tokens.ds.ensureIndexAsync({ fieldName: 'owner' });
     await store.audit.ds.ensureIndexAsync({ fieldName: 'time' });
     await store.sessions.ds.ensureIndexAsync({ fieldName: 'k', unique: true });
+    Object.defineProperty(store, 'close', { enumerable: false, value: function () { for (const name of COLLECTIONS) { try { store[name].ds.stopAutocompaction(); } catch (ex) { } } } });
     await store.revocations.ds.ensureIndexAsync({ fieldName: 'k', unique: true });
     return store;
 }
 
-module.exports = { openStore, COLLECTIONS };
+module.exports = { openStore, COLLECTIONS, MODES };

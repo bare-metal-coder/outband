@@ -17,6 +17,7 @@ const { resolveCredential } = require('./auth');
 const { Tickets, PROTOCOL } = require('./tickets');
 const { Idempotency } = require('./idempotency');
 const { fromTrustedProxy } = require('./util');
+const power = require('./power');
 
 const ID_RE = /^[A-Za-z0-9@$_-]{8,128}$/;
 const URL_CREDENTIALS = ['token', 'access_token', 'ticket'];
@@ -64,7 +65,7 @@ function buildRouter(core) {
     router.use(function (req, res, next) {
         if (core.state != 'ready') { sendError(res, 503, 'unavailable', 'Starting'); return; }
         const domain = req.xdomain;
-        if ((domain == null) || core.noAuthMode() || !hasConfiguredName(domain, ws.certificates)) {
+        if ((domain == null) || core.apiDisabled() || core.noAuthMode() || !hasConfiguredName(domain, ws.certificates)) {
             sendError(res, 503, 'unavailable', 'The API is not available in this server configuration'); return;
         }
         if (!checkHost(req, domain, ws.certificates, ws.args, fromTrustedProxy(ws.args, req))) { sendError(res, 421, 'invalid_host', 'Host is not a configured name'); return; }
@@ -112,6 +113,9 @@ function buildRouter(core) {
         if ((body == null) || (typeof body != 'object') || Array.isArray(body)) throw new ApiError(400, 'invalid_request', 'A JSON object body is required');
         for (const k of Object.keys(body)) { if ((k != 'action') && (k != 'via')) throw new ApiError(400, 'invalid_request', 'Unknown field', { field: k }); }
         if (typeof body.action != 'string') throw new ApiError(400, 'invalid_request', 'Missing field', { field: 'action' });
+        if (power.ACTIONS.indexOf(body.action) < 0) throw new ApiError(400, 'invalid_request', 'Invalid action', { field: 'action' });
+        if ((body.via !== undefined) && (power.PATHS.indexOf(body.via) < 0)) throw new ApiError(400, 'invalid_request', 'Invalid via', { field: 'via' });
+        ctx.requireScope(power.scopeForAction(body.action)); // central scope check, before any idempotency lookup
         const key = req.headers['idempotency-key'];
         if ((key !== undefined) && !Idempotency.validKey(key)) throw new ApiError(400, 'invalid_request', 'Invalid Idempotency-Key', { field: 'Idempotency-Key' });
         const lim = core.limits.action.hit(ctx.credentialKey);
@@ -142,6 +146,7 @@ function buildRouter(core) {
         const deviceId = checkId(req.params.deviceId, 'deviceId');
         const kind = req.params.kind;
         if ((kind != 'sol') && (kind != 'terminal')) throw new ApiError(400, 'invalid_request', 'Invalid kind', { field: 'kind' });
+        ctx.requireScope('console'); // central scope check
         const lim = core.limits.action.hit(ctx.credentialKey);
         if (!lim.allowed) throw new ApiError(429, 'rate_limited', 'Too many power and console requests', null, { 'Retry-After': String(lim.resetSec) });
         let target;

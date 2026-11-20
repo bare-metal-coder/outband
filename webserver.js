@@ -1058,6 +1058,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
                 obj.parent.DispatchEvent(['*'], obj, { etype: 'user', userid: user._id, username: user.name, action: 'logout', msgid: 2, msg: 'Account logout', domain: domain.id });
             }
             if (req.session.x) { clearDestroyedSessions(); obj.destroyedSessions[req.session.userid + '/' + req.session.x] = Date.now(); } // Destroy this session
+            if (req.session.x) { obj.outband.onLogout(req.session.userid, req.session.x); } // Outband: legacy logout is persisted
         }
         req.session = null;
         parent.debug('web', 'handleLogoutRequest: success.');
@@ -2515,7 +2516,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             if (req.query.port != null) { var qport = 0; try { qport = parseInt(req.query.port); } catch (ex) { } if ((typeof qport == 'number') && (qport > 0) && (qport < 65536)) { port = qport; } }
 
             // Generate a cookie and respond
-            var cookie = parent.encodeCookie({ userid: user._id, domainid: user.domain, nodeid: node._id, tcpport: port }, parent.loginCookieEncryptionKey);
+            var cookie = parent.encodeCookie({ userid: user._id, domainid: user.domain, nodeid: node._id, tcpport: port, x: req.session.x }, parent.loginCookieEncryptionKey); // Outband: bound to the session
             render(req, res, getRenderPage(page, req, domain), getRenderArgs({ cookie: cookie, name: encodeURIComponent(node.name).replace(/'/g, '%27'), serverCredentials: serverCredentials, features: features }, req, domain));
         });
     }
@@ -3931,7 +3932,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
 
                 // Create a authentication cookie
                 const authCookie = obj.parent.encodeCookie({ userid: user._id, domainid: domain.id, ip: req.clientIp, x: req.session.x }, obj.parent.loginCookieEncryptionKey);
-                const authRelayCookie = obj.parent.encodeCookie({ ruserid: user._id, domainid: domain.id }, obj.parent.loginCookieEncryptionKey);
+                const authRelayCookie = obj.parent.encodeCookie({ ruserid: user._id, domainid: domain.id, x: req.session.x }, obj.parent.loginCookieEncryptionKey); // Outband: bound to the session
                 var httpsPort = ((obj.args.aliasport == null) ? obj.args.port : obj.args.aliasport); // Use HTTPS alias port is specified
                 render(req, res, getRenderPage('xterm', req, domain), getRenderArgs({ serverDnsName: obj.getWebServerName(domain, req), serverRedirPort: args.redirport, serverPublicPort: httpsPort, authCookie: authCookie, authRelayCookie: authRelayCookie, logoutControls: encodeURIComponent(JSON.stringify(logoutcontrols)).replace(/'/g, '%27'), name: EscapeHtml(node.name) }, req, domain));
             });

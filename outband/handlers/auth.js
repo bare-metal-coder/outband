@@ -7,6 +7,7 @@
 
 const crypto = require('crypto');
 const { ApiError, iso, lastSegment, FULL_RIGHTS } = require('../util');
+const { redactString } = require('../redact');
 const { checkFields } = require('../http');
 const { loadUser, userBlocked } = require('../auth');
 const twofa = require('../twofa');
@@ -28,6 +29,9 @@ function userView(user, full) {
     if (full) { u.email = (typeof user.email == 'string') ? user.email : null; u.siteadmin = (typeof user.siteadmin == 'number') ? (user.siteadmin >>> 0) : 0; }
     return u;
 }
+
+/** A user-supplied name made safe for log lines: no control characters, secrets redacted, bounded length. */
+function logName(s) { return redactString(String(s).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, '?')).substring(0, 64); }
 
 function serverName(domain) { return (typeof domain.title == 'string' && domain.title.length > 0) ? domain.title : 'Outband'; }
 
@@ -123,8 +127,10 @@ async function secondFactorStep(core, req, res, p, body, mcUser, onDiscard) {
     const locked = core.pending.userLockedFor(p.userid);
     if (locked > 0) throw new ApiError(429, 'rate_limited', 'Too many wrong codes', null, { 'Retry-After': String(locked) });
     if (core.webserver.checkAllow2Fa(req) == false) throw new ApiError(429, 'rate_limited', 'Too many attempts from this address', null, { 'Retry-After': '60' });
-    const ok = twofa.codeFormatOk(body.code, body.method, p.methods) && await checkCode(core, req, domain, mcUser, body.code);
+    const formatOk = twofa.codeFormatOk(body.code, body.method, p.methods);
+    const ok = formatOk && await checkCode(core, req, domain, mcUser, body.code);
     if (!ok) {
+        if (!formatOk) { try { core.webserver.setbad2Fa(req); } catch (ex) { } } // MeshCentral's checker records the other failures itself
         const discarded = core.pending.wrongCode(p);
         if (discarded && onDiscard) onDiscard();
         core.audit.write({ domain: domain.id, action: 'outband.2fa', outcome: 'failed', user: p.userid, ip: req.clientIp });
@@ -152,7 +158,7 @@ module.exports = function (core) {
         if (user.groups) { for (const i in user.groups) { targets.push('server-users:' + i); } }
         try {
             parent.DispatchEvent(targets, ws, { etype: 'user', userid: user._id, username: user.name, account: ws.CloneSafeUser(mcUser || user), action: 'login', msgid: 107, msgArgs: [req.clientIp, 'Outband API', ''], msg: 'Account login from ' + req.clientIp + ', Outband API', domain: req.xdomain.id, ip: req.clientIp });
-            parent.authLog('https', 'Accepted password for ' + user.name + ' from ' + req.clientIp + ' (Outband API)', { sessionid: req.session.x });
+            parent.authLog('https', 'Accepted password for ' + logName(user.name) + ' from ' + req.clientIp + ' (Outband API)');
         } catch (ex) { }
         core.audit.write({ domain: req.xdomain.id, action: 'outband.login', outcome: 'success', user: user._id, userName: user.name, ip: req.clientIp });
     }
@@ -162,7 +168,10 @@ module.exports = function (core) {
         const domain = req.xdomain;
         const blockingMode = (parent.config.settings.maxinvalidlogin && parent.config.settings.maxinvalidlogin.blocking) || 'iprange';
         if ((blockingMode !== 'username') && (ws.checkAllowLogin(req) === false)) throw new ApiError(429, 'rate_limited', 'Too many failed logins from this address', null, { 'Retry-After': '60' });
-        const accountKey = domain.id + '/' + username.toLowerCase();
+        // Unknown local user names share one bucket, so they cannot evict the counters of real accounts.
+        const local = (domain.auth == null) || (domain.auth == '') || ((domain.auth != 'ldap') && (domain.auth != 'sspi'));
+        const known = !local || (ws.users['user/' + domain.id + '/' + username.toLowerCase()] != null);
+        const accountKey = domain.id + '/' + (known ? username.toLowerCase() : '\u0000unknown');
         const refuse = function (reason, userid) {
             core.audit.write({ domain: domain.id, action: auditAction, outcome: 'failed', reason: reason, user: userid || null, ip: req.clientIp });
             return REFUSED();
@@ -174,13 +183,14 @@ module.exports = function (core) {
         if ((r.userid == null) || r.err) {
             core.limits.account.fail(accountKey);
             try { ws.setbadLogin(req, username); } catch (ex) { }
-            try { parent.authLog('https', 'Failed password for ' + username + ' from ' + req.clientIp + ' (Outband API)'); } catch (ex) { }
+            try { parent.authLog('https', 'Failed password for ' + logName(username) + ' from ' + req.clientIp + ' (Outband API)'); } catch (ex) { }
             throw refuse((r.err == 'locked') ? 'locked' : 'bad_password');
         }
         if ((r.loginOptions != null) && (r.loginOptions.tokenName != null)) throw refuse('login_token', r.userid);
         const user = await loadUser(ws, r.userid);
         const mcUser = ws.users[r.userid];
         if (userBlocked(user) || (mcUser == null)) throw refuse('locked', r.userid);
+        core.notBefore.observe(user); // a credential change is recorded before any new session is created
         return { user: user, mcUser: mcUser, accountKey: accountKey, refuse: refuse };
     }
 
@@ -240,6 +250,13 @@ module.exports = function (core) {
         if (userBlocked(user) || (mcUser == null)) { core.pending.discard(p.id); req.session = null; throw new ApiError(401, 'no_pending_login', 'No pending login'); }
         const r = await secondFactorStep(core, req, res, p, body, mcUser, function () { req.session = null; });
         if (r == 'sent') { res.status(202).end(); return; }
+        // Re-check what may have changed since the password step.
+        const fresh = await loadUser(ws, p.userid);
+        if (userBlocked(fresh) || (core.notBefore.observe(fresh) > p.passwordTime) || loginBlockedByPolicy(core, domain, ws.users[p.userid] || fresh, req)) {
+            req.session = null;
+            core.audit.write({ domain: domain.id, action: 'outband.2fa', outcome: 'denied', reason: 'recheck', user: p.userid, ip: req.clientIp });
+            throw new ApiError(401, 'no_pending_login', 'No pending login');
+        }
         core.audit.write({ domain: domain.id, action: 'outband.2fa', outcome: 'success', user: user._id, userName: user.name, ip: req.clientIp });
         await startSession(req, user, p.passwordTime, Date.now());
         res.json({ authenticated: true, user: userView(user, true) });

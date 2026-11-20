@@ -80,7 +80,7 @@ class PendingLogins {
         if (times.length >= MAX_SENDS_PER_USER_HOUR) return Math.ceil((times[0] + 3600000 - now) / 1000);
         times.push(now);
         this.userSends.set(p.userid, times);
-        if (this.userSends.size > MAX_PENDING) { this.userSends.clear(); this.userSends.set(p.userid, times); }
+        while (this.userSends.size > MAX_PENDING) { const oldest = this.userSends.keys().next().value; if (oldest == p.userid) break; this.userSends.delete(oldest); }
         p.sends++; p.lastSend = now;
         return 0;
     }

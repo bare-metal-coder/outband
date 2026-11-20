@@ -74,7 +74,7 @@ function parseHost(value) {
 /** The Host header (or X-Forwarded-Host from a trusted proxy) must be a configured name with the expected port. */
 function checkHost(req, domain, certificates, args, trusted) {
     let value = req.headers.host;
-    if (trusted && (typeof req.headers['x-forwarded-host'] == 'string')) { value = req.headers['x-forwarded-host'].split(',')[0].trim(); }
+    if (trusted && (typeof req.headers['x-forwarded-host'] == 'string')) { value = require('./util').lastHop(req.headers['x-forwarded-host']); } // last hop, written by the trusted proxy
     const h = parseHost(value);
     if (h == null) return false;
     for (const e of hostEntries(domain, certificates, args)) {

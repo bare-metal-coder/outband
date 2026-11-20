@@ -7,7 +7,8 @@
  *   core.ready                     promise; the session middleware awaits it
  *   core.onNewSession(req)         from setSessionRandom: create the session record
  *   core.sessionValid(session)     from the session middleware
- *   core.checkAuthCookie(cookie)   from checkAuthCookie
+ *   core.checkAuthCookie(cookie[, sessionRequired])  from checkAuthCookie and the relay cookie checks
+ *   core.onLogout(userid, x)       from the legacy logout handler
  *   core.router()                  mounted at /api/v1
  * @license Apache-2.0
  */
@@ -25,6 +26,7 @@ const { RuntimeSettings } = require('./settings');
 const { PendingLogins } = require('./pending');
 const { Tickets } = require('./tickets');
 const { Idempotency } = require('./idempotency');
+const { NotBefore } = require('./notbefore');
 const { WindowLimiter, FailureLock, ConcurrencyLimiter } = require('./ratelimit');
 const { installDebugRedaction } = require('./redact');
 const { createStubResources } = require('./resources');
@@ -64,6 +66,8 @@ function create(webserver, parent, hooks, options) {
     installDebugRedaction(parent);
 
     core.noAuthMode = function () { return (webserver.args.nousers === true) || ((typeof webserver.args.user == 'string') && (webserver.args.user.length > 0)); };
+    /** The API is off (`outbandApi.enabled: false`), or the setup is not supported in this alpha (multi-server). */
+    core.apiDisabled = function () { return (core.config.enabled === false) || (parent.multiServer != null) || (parent.config && parent.config.peers != null); };
     core.revalidate = function (ctx) { return revalidate(core, ctx); };
     core.setResources = function (impl) { core.resources = impl; };
 
@@ -71,7 +75,13 @@ function create(webserver, parent, hooks, options) {
         if ((core.sessions != null) && req && req.session) core.sessions.onNewSession(req.session.userid, req.session.x);
     };
     core.sessionValid = function (session) { return (core.sessions == null) ? false : core.sessions.checkSession(session); };
-    core.checkAuthCookie = function (cookie) { return (core.sessions == null) ? false : core.sessions.checkAuthCookie(cookie); };
+    core.checkAuthCookie = function (cookie, sessionRequired) { return (core.sessions == null) ? false : core.sessions.checkAuthCookie(cookie, sessionRequired === true); };
+    /** Legacy logout: persist the revocation and cancel the session's console tickets. */
+    core.onLogout = function (userid, x) {
+        if ((core.sessions == null) || (typeof userid != 'string') || (typeof x != 'string')) return;
+        core.sessions.revoke(userid, x, 'logout').catch(function () { });
+        core.tickets.cancelCredential('ses:' + userid + '/' + x);
+    };
 
     let router = null;
     core.router = function () { if (router == null) { router = require('./router').buildRouter(core); } return router; };
@@ -79,6 +89,7 @@ function create(webserver, parent, hooks, options) {
     /** User deletion: erase per spec (tokens, session records, pending logins now; audit pseudonymized). */
     core.eraseUser = async function (userid) {
         await core.tokens.removeUser(userid);
+        await core.notBefore.forget(userid);
         await core.sessions.revokeUser(userid, 'locked');
         core.pending.removeUser(userid);
         core.tickets.cancelUser(userid);
@@ -94,11 +105,20 @@ function create(webserver, parent, hooks, options) {
         core.pseudonyms = new Pseudonyms(store);
         core.settings = new RuntimeSettings(store, core.config, core.bus);
         core.idempotency = new Idempotency(store);
+        core.notBefore = new NotBefore(store, core.bus);
+        await core.notBefore.load();
         await core.pseudonyms.load();
         await core.settings.load();
         await core.sessions.load();
+        await Promise.all([core.audit.purge(), core.tokens.purge(), core.idempotency.purge()]); // retention, also at startup
+        // A credential change revokes the user's earlier tokens and sessions (listed as revoked).
+        core.bus.on('credentials-changed', function (e) {
+            core.tokens.revokeIssuedBefore(e.userid, e.notBefore, 'credentials_changed').catch(function () { });
+            for (const r of Array.from(core.sessions.records.values())) { if ((r.u == e.userid) && (r.ia < e.notBefore)) core.sessions.revoke(r.u, r.x, 'expired'); }
+        });
         if (!options.noTimers) {
             core.settings.start();
+            core.notBefore.start(function () { return webserver.users; });
             const every = function (ms, fn) { const t = setInterval(fn, ms); if (t.unref) t.unref(); core.timers.push(t); };
             every(60000, function () { core.sessions.sweep(); });
             every(3600000, function () { core.audit.purge(); core.tokens.purge(); core.idempotency.purge(); });
@@ -125,7 +145,7 @@ function create(webserver, parent, hooks, options) {
         console.log('Outband API failed to start: ' + (err && err.message));
     });
 
-    core.close = function () { if (core.settings) core.settings.stop(); for (const t of core.timers) clearInterval(t); core.timers = []; };
+    core.close = function () { if (core.settings) core.settings.stop(); if (core.notBefore) core.notBefore.stop(); if (core.store) core.store.close(); for (const t of core.timers) clearInterval(t); core.timers = []; };
     return core;
 }
 

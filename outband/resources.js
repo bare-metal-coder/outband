@@ -38,6 +38,20 @@ const { ApiError } = require('./util');
  * stream(ctx, req, res, args: {types: string[]|null, lastEventId: string|null}): Promise<void>  // SSE; owns the response
  */
 
+/**
+ * Privacy contract (required). Every Device, DeviceDetail and Event object,
+ * in REST responses and in stream messages, MUST be built by the mappers in
+ * `outband/mappers.js`:
+ *   mapDevice(ctx, node, info), mapDeviceDetail(ctx, node, info), mapEvent(ctx, event)
+ * and they MUST decide each private field through the AuthContext helpers:
+ *   ctx.seesDeviceAddresses()  for `ips` and `hardware.serial`
+ *   ctx.seesIdentities()       for user and token names (else ctx.pseudonymUser / ctx.pseudonymToken)
+ *   ctx.seesSourceIp()         for `source_ip` and `ip` / `email` message parameters
+ * and build Outband audit messages with `Audit.message(doc)`. No other code
+ * path may produce these objects. test/outband/privacy-contract.js checks
+ * the mappers and must pass.
+ */
+
 function notImplemented() { throw new ApiError(501, 'not_implemented', 'Not implemented yet'); }
 
 /** @returns {Resources} */

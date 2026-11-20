@@ -50,7 +50,9 @@ API settings go under `settings.outbandApi` in `config.json`:
 ```json
 {
   "settings": {
+    "sessionKey": "<long random secret>",
     "outbandApi": {
+      "enabled": true,
       "sessionLifetimeHours": 12,
       "auditRetentionDays": 365,
       "bearer": true
@@ -58,6 +60,22 @@ API settings go under `settings.outbandApi` in `config.json`:
   }
 }
 ```
+
+## Deployment notes
+
+* **`sessionKey` (required).** Set `settings.sessionKey` in `config.json`
+  to a long random value and keep it secret, like a password. It signs the
+  session cookies; without it the server picks a new key at every start and
+  every browser session ends on restart. Rotating it logs everyone out.
+* **Reverse proxies.** List the proxy's address in `trustedProxy` (or
+  `tlsOffload`) as an address or CIDR. Outband uses `X-Forwarded-Host` and
+  `X-Forwarded-Proto` only from those addresses, and only their last value,
+  so the proxy must overwrite these headers rather than append to what the
+  client sent.
+* **Single server only.** In this alpha the API answers `503` when
+  MeshCentral runs as part of a multi-server (peering) setup.
+* **API switch.** `settings.outbandApi.enabled: false` turns `/api/v1` off
+  (every endpoint except `/api/v1/health` answers `503`).
 
 ## Development
 

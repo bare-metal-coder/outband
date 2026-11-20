@@ -17,7 +17,7 @@ function readConfig(parent) {
     const s = ((parent.config && parent.config.settings && parent.config.settings.outbandapi) || {});
     const rl = (typeof s.ratelimits == 'object' && s.ratelimits) ? s.ratelimits : {};
     return {
-        enabled: (s.enabled !== false),
+        enabled: (s.enabled !== false), // false: every endpoint except /health answers 503
         sessionLifetimeMs: num(s.sessionlifetimehours, 12, 1, 24 * 30) * 3600000,
         auditRetentionDays: num(s.auditretentiondays, 365, 1, 3650),
         bearerDefault: (s.bearer !== false),

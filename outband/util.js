@@ -99,25 +99,38 @@ function truncateIp(ip) {
     return null;
 }
 
-/** Whether the TCP peer is a trusted proxy / TLS offloader per MeshCentral settings. */
+/**
+ * Whether the TCP peer is a configured trusted proxy or TLS offloader, so
+ * its X-Forwarded-Host and X-Forwarded-Proto headers may be used. Only an
+ * explicit address list counts (`trustedProxy` / `tlsOffload` set to
+ * addresses or CIDRs); `true` ("any peer") does not. The proxy must
+ * overwrite these headers, not append to client-supplied ones; Outband
+ * reads only the last hop.
+ */
 function fromTrustedProxy(args, req) {
     let peer = (req.socket && req.socket.remoteAddress) || '';
     if (peer.startsWith('::ffff:')) { peer = peer.substring(7); }
     const match = function (list) {
-        if (!Array.isArray(list)) { list = (typeof list == 'string') ? list.split(',') : []; }
+        if (typeof list == 'string') { list = list.split(','); }
+        if (!Array.isArray(list)) return false;
         for (const c of list) { if (ipInCidr(peer, String(c).trim())) return true; }
         return false;
     };
-    if ((args.trustedproxy === true) || (args.tlsoffload === true)) return true;
-    if ((args.trustedproxy != null) && (typeof args.trustedproxy == 'object' || typeof args.trustedproxy == 'string') && match(args.trustedproxy)) return true;
-    if ((args.tlsoffload != null) && (typeof args.tlsoffload == 'object' || typeof args.tlsoffload == 'string') && match(args.tlsoffload)) return true;
-    return false;
+    return match(args.trustedproxy) || match(args.tlsoffload);
+}
+
+/** The last (nearest) value of a comma-separated forwarding header. */
+function lastHop(value) {
+    if (typeof value != 'string') return null;
+    const parts = value.split(',');
+    const v = parts[parts.length - 1].trim();
+    return (v.length > 0) ? v : null;
 }
 
 /** True when the request arrived over TLS, directly or through a trusted TLS offloader. */
 function isSecureRequest(args, req) {
     if (req.socket && req.socket.encrypted) return true;
-    return fromTrustedProxy(args, req) && (String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() == 'https');
+    return fromTrustedProxy(args, req) && (String(lastHop(req.headers['x-forwarded-proto']) || '').toLowerCase() == 'https');
 }
 
 /** Encode/decode opaque pagination cursors. */
@@ -141,6 +154,6 @@ function parseLimit(q) {
 module.exports = {
     API_VERSION, OUTBAND_VERSION, FULL_RIGHTS, SITE_LOCKED,
     randomId, iso, sendError, ApiError, safeEqual, sha256Hex, lastSegment,
-    ipInCidr, isValidCidr, truncateIp, fromTrustedProxy, isSecureRequest,
+    ipInCidr, isValidCidr, truncateIp, fromTrustedProxy, lastHop, isSecureRequest,
     encodeCursor, decodeCursor, parseLimit
 };

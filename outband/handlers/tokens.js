@@ -32,7 +32,7 @@ module.exports = function (core) {
         if ((body.scopes === undefined) == (body.profile === undefined)) throw new ApiError(400, 'invalid_request', 'Give exactly one of scopes or profile', { field: (body.scopes === undefined) ? 'scopes' : 'profile' });
         let scopes;
         if (body.profile !== undefined) {
-            if ((typeof body.profile != 'string') || (PROFILES[body.profile] == null)) throw new ApiError(400, 'invalid_request', 'Unknown profile', { field: 'profile' });
+            if ((typeof body.profile != 'string') || !Object.prototype.hasOwnProperty.call(PROFILES, body.profile)) throw new ApiError(400, 'invalid_request', 'Unknown profile', { field: 'profile' });
             scopes = PROFILES[body.profile].slice();
         } else {
             if (!Array.isArray(body.scopes) || (body.scopes.length < 1)) throw new ApiError(400, 'invalid_request', 'Invalid scopes', { field: 'scopes' });
@@ -99,7 +99,7 @@ module.exports = function (core) {
         await core.tokens.revoke(doc, ctx.userid, 'revoked');
         core.tickets.cancelCredential('tok:' + doc._id);
         if (was == null) {
-            core.audit.write({ domain: ctx.domain.id, action: 'outband.token.revoke', user: ctx.userid, userName: ctx.user.name, tokenId: doc._id, tokenName: doc.name, ip: ctx.ip, params: admin ? { owner: lastSegment(doc.owner) } : {} });
+            core.audit.write({ domain: ctx.domain.id, action: 'outband.token.revoke', user: ctx.userid, userName: ctx.user.name, tokenId: doc._id, tokenName: doc.name, ip: ctx.ip, subject: (doc.owner != ctx.userid) ? doc.owner : null, params: admin ? { owner: lastSegment(doc.owner) } : {} });
         }
         res.status(204).end();
     }

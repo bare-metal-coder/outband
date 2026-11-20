@@ -117,6 +117,20 @@ async function stopServer() {
     await new Promise(function (r) { setTimeout(r, 1000); });
 }
 
+/** True when control.ashx accepts the cookie as a logged-in session (it sends serverinfo). */
+function controlSession(cookie) {
+    const WebSocket = require('ws');
+    return new Promise(function (resolve) {
+        let done = false;
+        const finish = function (v) { if (!done) { done = true; try { ws.close(); } catch (ex) { } resolve(v); } };
+        const ws = new WebSocket('wss://127.0.0.1:' + PORT + '/control.ashx', { headers: { host: HOST, cookie: cookie }, servername: NAME, rejectUnauthorized: false });
+        ws.on('message', function (m) { let j = null; try { j = JSON.parse(m.toString()); } catch (ex) { } if (j && j.action == 'serverinfo') finish(true); if (j && j.action == 'close') finish(false); });
+        ws.on('close', function () { finish(false); });
+        ws.on('error', function () { finish(false); });
+        setTimeout(function () { finish(false); }, 10000);
+    });
+}
+
 function loggedInOnLegacy(r) { return (r.status == 200) && !r.text.includes('id=loginpanel') && r.text.includes('logoutControls'); }
 
 const liveTest = function (name, opts, fn) { if (LIVE) { test(name, opts, fn); } else { test(name + ' (set OUTBAND_LIVE=1)', function () { }); } };
@@ -209,6 +223,19 @@ liveTest('live MeshCentral', { timeout: 900000 }, async function (t) {
         assert.ok(!loggedInOnLegacy(await request('GET', '/', { cookie: aliceCookie })), 'still refused after restart');
         // The admin session survived the restart (session records are persisted)
         assert.strictEqual((await api('GET', '/api/v1/server', { cookie: adminCookie })).status, 200);
+    });
+
+    await t.test('legacy logout is persisted: refused on /api/v1, control.ashx and the legacy UI after a restart', async function () {
+        const r = await api('POST', '/api/v1/auth/login', { csrf: true, json: { username: 'alice', password: PASS.alice } });
+        const cookie = r.cookie;
+        assert.strictEqual(await controlSession(cookie), true, 'control.ashx accepts the session before logout');
+        const out = await request('GET', '/logout', { cookie: cookie });
+        assert.ok(out.status < 400);
+        await stopServer();
+        await startServer(env.dir);
+        assert.strictEqual((await api('GET', '/api/v1/server', { cookie: cookie })).status, 401);
+        assert.strictEqual(await controlSession(cookie), false, 'control.ashx refuses it');
+        assert.ok(!loggedInOnLegacy(await request('GET', '/', { cookie: cookie })), 'legacy UI refuses it');
     });
 });
 

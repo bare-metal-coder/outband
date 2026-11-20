@@ -62,6 +62,7 @@ async function start(o) {
         checkAllowLogin: function () { return !badLogins.blocked; },
         setbadLogin: function () { },
         checkAllow2Fa: function () { return true; },
+        setbad2Fa: function () { badLogins.bad2fa = (badLogins.bad2fa || 0) + 1; },
         force2factorPending: function () { return false; }
     };
     const debugLines = [];
@@ -71,16 +72,17 @@ async function start(o) {
         debugSources: '*',
         debug: function (source, ...args) { debugLines.push([source].concat(args).map(function (a) { return (typeof a == 'string') ? a : JSON.stringify(a); }).join(' ')); },
         DispatchEvent: function (ids, src, ev) { events.push(ev); },
-        authLog: function () { },
+        authLog: function (...a) { debugLines.push('AUTHLOG ' + a.map(function (x) { return (typeof x == 'string') ? x : JSON.stringify(x); }).join(' ')); },
         addServerWarning: function () { }
     };
+    Object.assign(parent, o.parent || {});
     const hooks = {
         checkUserOneTimePasswordRequired: function (d, user) { return !!user.otpsecret; },
         checkUserOneTimePassword: function (req, d, user, token, hw, cb) { setImmediate(function () { cb(token === user.testcode); }); },
         userHasSecondFactor: function (d, user) { return !!user.otpsecret; },
         setSessionRandom: function (req) { if (req.session.x != null) return; req.session.x = crypto.randomBytes(6).toString('base64'); core.onNewSession(req); }
     };
-    const core = require('../../outband').create(webserver, parent, hooks, { inMemory: true, noTimers: true });
+    const core = require('../../outband').create(webserver, parent, hooks, Object.assign({ inMemory: true, noTimers: true }, o.coreOptions || {}));
     await core.ready;
 
     const app = express();

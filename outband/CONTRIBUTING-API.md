@@ -119,6 +119,34 @@ least every 5 seconds and also on these `core.bus` events:
 `session-ended {userid, x, reason}`, `token-ended {tokenId, reason}`,
 `bearer-disabled`. End with a `closed` message carrying the reason.
 
+## Privacy contract (required)
+
+Every Device, DeviceDetail and Event object, in REST responses **and** in
+stream messages, MUST be built by the mappers in `outband/mappers.js`:
+
+```js
+module.exports = {
+    mapDevice(ctx, node, info),        // -> spec Device
+    mapDeviceDetail(ctx, node, info),  // -> spec DeviceDetail
+    mapEvent(ctx, event)               // -> spec Event (MeshCentral event or Outband audit record)
+};
+```
+
+They MUST decide each private field through the context helpers, never by
+their own rules:
+
+| Field | Helper |
+|---|---|
+| `ips`, `hardware.serial` | `ctx.seesDeviceAddresses()` |
+| user and token names; otherwise `ctx.pseudonymUser(userid)` / `ctx.pseudonymToken(tokenId)` | `ctx.seesIdentities()` |
+| `source_ip`, and `ip` / `email` message parameters | `ctx.seesSourceIp()` |
+| Outband audit record messages | `Audit.message(doc)` |
+
+`test/outband/privacy-contract.js` feeds private values to the mappers under
+several credentials and fails on any leak or on a helper that was not
+consulted; `test/outband/privacy.test.js` runs it against
+`outband/mappers.js`. The resources change must pass it.
+
 ## Redaction and mapping
 
 * Build every response object field by field from an allowlist. Never

@@ -23,7 +23,8 @@ function userBlocked(user) {
 }
 
 /** Time (ms) before which sessions and tokens of this user are invalid (password change or reset). */
-function notBefore(user) {
+function notBefore(core, user) {
+    if (core && core.notBefore) return core.notBefore.observe(user);
     return ((typeof user.passchange == 'number') && (user.passchange > 0)) ? (user.passchange * 1000) : 0;
 }
 
@@ -202,7 +203,8 @@ async function resolveCredential(core, req) {
             throw new ApiError(403, 'ip_not_allowed', 'Client address not allowed for this token');
         }
         const user = await loadUser(core.webserver, doc.owner);
-        if (userBlocked(user) || (notBefore(user) > doc.created)) { auditEnded('user'); throw new ApiError(401, 'token_revoked', 'Token revoked'); }
+        if (userBlocked(user)) { auditEnded('user'); throw new ApiError(401, 'token_revoked', 'Token revoked'); }
+        if (notBefore(core, user) > doc.created) { await core.tokens.revoke(doc, null, 'credentials_changed'); auditEnded('credentials_changed'); throw new ApiError(401, 'token_revoked', 'Token revoked'); }
         core.tokens.touch(doc);
         const scopes = SCOPES.filter(function (s) { return (s == 'read') || (doc.scopes.indexOf(s) >= 0); });
         return new AuthContext(core, { domain: domain, user: user, method: 'token', scopes: scopes, token: doc, credentialKey: 'tok:' + doc._id, ip: ip });
@@ -216,7 +218,7 @@ async function resolveCredential(core, req) {
     const rec = core.sessions.get(s.userid, s.x);
     if (rec == null) { clear(); throw new ApiError(401, 'unauthenticated', 'Session expired'); }
     const user = await loadUser(core.webserver, s.userid);
-    if (userBlocked(user) || (notBefore(user) > rec.ia)) {
+    if (userBlocked(user) || (notBefore(core, user) > rec.ia)) {
         await core.sessions.revoke(s.userid, s.x, userBlocked(user) ? 'locked' : 'expired');
         clear();
         throw new ApiError(401, 'unauthenticated', 'Session ended');
@@ -233,7 +235,7 @@ async function revalidate(core, ctx) {
         if (doc.expires <= Date.now()) return 'expired';
         const user = await loadUser(core.webserver, doc.owner);
         if (userBlocked(user)) return 'locked';
-        if (notBefore(user) > doc.created) return 'revoked';
+        if (notBefore(core, user) > doc.created) { await core.tokens.revoke(doc, null, 'credentials_changed'); return 'revoked'; }
         ctx.user = user;
         return null;
     }
@@ -241,7 +243,7 @@ async function revalidate(core, ctx) {
     if (rec == null) return core.sessions.revoked.has(ctx.userid + '/' + (ctx.session && ctx.session.x)) ? 'logout' : 'expired';
     const user = await loadUser(core.webserver, ctx.userid);
     if (userBlocked(user)) return 'locked';
-    if (notBefore(user) > rec.ia) return 'expired';
+    if (notBefore(core, user) > rec.ia) return 'expired';
     ctx.user = user;
     return null;
 }
