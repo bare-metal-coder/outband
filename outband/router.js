@@ -30,7 +30,7 @@ function optTime(q, field) {
     if ((d == null) || isNaN(d.getTime()) || !/^\d{4}-\d{2}-\d{2}T/.test(q[field])) throw new ApiError(400, 'invalid_request', 'Invalid ' + field, { field: field });
     return d;
 }
-function sendPage(res, r) { res.json({ items: r.items, next_cursor: r.next ? encodeCursor(r.next) : null }); }
+function sendPage(res, r) { const b = { items: r.items, next_cursor: r.next ? encodeCursor(r.next) : null }; if (r.truncated === true) b.truncated = true; res.json(b); }
 function pageArgs(q) { return { limit: parseLimit(q), cursor: decodeCursor(q.cursor) }; }
 
 function buildRouter(core) {

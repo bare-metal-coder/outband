@@ -120,6 +120,14 @@ async function collect(ctx, f, limit, cursor) {
         wantMc ? dbEvents(ctx, ids, D) : [],
         wantAudit ? ctx.core.audit.find(q, W, cursor).then(function (r) { return r.items; }) : []
     ]);
+    // Identical stored events without an id (same millisecond, same content) get distinct derived ids:
+    // the tie-breaker is the occurrence number in the order the database returned them.
+    const seenIds = new Map();
+    for (const ev of parts[0]) {
+        if (ev._id != null) continue;
+        const base = eventId(ev), n = seenIds.get(base) || 0;
+        seenIds.set(base, n + 1); ev._n = n;
+    }
     const byNewest = function (a, b) { const x = posOf(a), y = posOf(b); return older(x, y) ? 1 : (older(y, x) ? -1 : 0); };
     const mcRaw = parts[0].slice().sort(byNewest), auRaw = parts[1].slice().sort(byNewest);
 
@@ -152,7 +160,11 @@ async function collect(ctx, f, limit, cursor) {
         const d = wantMc ? mcRaw.filter(function (ev) { return !older(posOf(ev), pos); }).length : depth;
         next = { t: pos.t, i: pos.i, d: Math.min(Math.max(d, depth), MAX_DEPTH) };
     }
-    return { items: items.map(function (ev) { return mapEvent(ctx, ev); }), next: next };
+    // The depth cap stopped the walk: older MeshCentral events exist that this walk cannot reach.
+    const truncated = mcCapped || (wantMc === false && f.audit !== true && depth >= MAX_DEPTH);
+    const out = { items: items.map(function (ev) { return mapEvent(ctx, ev); }), next: next };
+    if (truncated) out.truncated = true;
+    return out;
 }
 
 module.exports = { eventVisible, collect, visibleMeshIds, timeOf, MAX_DEPTH };

@@ -728,3 +728,34 @@ test('core.close detaches the hub from MeshCentral and the audit feed', async fu
     assert.strictEqual(removed.length, 1); assert.strictEqual(removed[0], h.core.hub.handler);
     assert.strictEqual(h.core.audit.onWrite, null);
 });
+
+test('events: the depth cap is reported as truncated, a true end of history is not; derived ids are distinct', async function () {
+    await withWorld(async function (h) {
+        const alice = await session(h, 'alice');
+        // identical stored events without an id get distinct ids
+        const t = '2026-02-02T00:00:00.000Z';
+        for (let i = 0; i < 3; i++) mcEvent(h, { _id: undefined, nodeid: FN1, meshid: MA, ids: [FN1, MA, '*'], time: t });
+        let r = await call(alice, 'GET', '/api/v1/events?audit=false');
+        assert.strictEqual(r.body.items.length, 3);
+        assert.strictEqual(new Set(r.body.items.map(function (e) { return e.id; })).size, 3);
+        const again = await call(alice, 'GET', '/api/v1/events?audit=false');
+        assert.deepStrictEqual(again.body.items.map(function (e) { return e.id; }), r.body.items.map(function (e) { return e.id; }), 'ids are stable');
+        assert.ok(!('truncated' in r.body), 'true end of history');
+        // more history than the depth cap: the walk ends truncated
+        h.mcEvents.length = 0;
+        manyEvents(h, 5200, 100000);
+        let cur = null, pages = 0, last;
+        const flags = [];
+        do {
+            last = await call(alice, 'GET', '/api/v1/events?audit=false&type=zzz&limit=200' + (cur ? '&cursor=' + cur : ''));
+            flags.push(last.body.truncated === true); cur = last.body.next_cursor; pages++;
+        } while (cur && pages < 30);
+        assert.strictEqual(cur, null); assert.strictEqual(last.body.truncated, true);
+        assert.ok(!flags.slice(0, 2).some(Boolean), 'not flagged before the cap is reached');
+        // a long history that is read to its end is not flagged
+        h.mcEvents.length = 0;
+        manyEvents(h, 450, 100000);
+        cur = null; pages = 0;
+        do { last = await call(alice, 'GET', '/api/v1/events?audit=false&limit=200' + (cur ? '&cursor=' + cur : '')); assert.ok(!('truncated' in last.body)); cur = last.body.next_cursor; pages++; } while (cur && pages < 10);
+    });
+});

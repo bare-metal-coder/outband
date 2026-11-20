@@ -331,7 +331,8 @@ info:
     * **Device and group labels.** The `name`, `description` and `tags` of a
       device, and the `name` and `description` of a group, are visible to
       every caller that can see the device or group (scope `read`). They are
-      set by the group's administrators and should not hold secrets.
+      set by the group's administrators and should not hold secrets. Do not put IP addresses or secrets in device
+      names.
     * **Not stored.** Outband stores no user agents and no request bodies.
     * **Retention.**
       * Outband audit events: 365 days by default
@@ -385,7 +386,8 @@ info:
     * **Event reads:** 30 requests per minute per credential, for
       `/events` and `/devices/{id}/events` together.
     * **Streams:** 5 concurrent per credential, and a server-wide cap
-      (default 500).
+      (default 500). A stream over either cap is refused with `429
+      rate_limited` and `Retry-After`.
     * **Per device:** 6 power actions per minute, across all callers.
     * Operators can change these with `outbandApi.rateLimits`. Responses
       outside the auth endpoints carry `RateLimit-Limit`,
@@ -1396,8 +1398,11 @@ paths:
         keep following it. Each request reads a bounded number of stored
         events, and a listing reaches at most the newest 5000 stored
         MeshCentral events in the caller's scope, so `next_cursor` is `null`
-        when the history is exhausted or that depth is reached. Narrow
-        `device` or `group` to reach older events of a busy domain.
+        when the history is exhausted or that depth is reached; in the
+        second case the page carries `truncated: true`. Narrow `device` or
+        `group` to reach older events of a busy domain. For filtered walks
+        use a large `limit` (up to 200) and honour `Retry-After`; the cursor
+        stays valid after a `429`.
       parameters:
         - name: device
           in: query
@@ -2283,6 +2288,10 @@ components:
         items:
           type: array
           items: { $ref: '#/components/schemas/Event' }
+        truncated:
+          type: boolean
+          const: true
+          description: Present (`true`) when the read depth limit stopped this listing. With a null `next_cursor` it means older events exist that this walk cannot reach, unlike a true end of history, where the field is absent. See `listEvents`.
         next_cursor: { $ref: '#/components/schemas/NextCursor' }
 
     StreamReady:

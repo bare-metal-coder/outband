@@ -161,7 +161,7 @@ const GENERIC = { node: 'Device event', mesh: 'Device group event', user: 'User 
 /** Stable id of an event; a stored MeshCentral event without an id gets one derived from its content. */
 function eventId(ev) {
     if (ev._id != null) return String(ev._id);
-    return 'mc_' + require('crypto').createHash('sha256').update(JSON.stringify([ev.time, ev.action, ev.nodeid, ev.meshid, ev.userid, ev.etype])).digest('hex').substring(0, 20);
+    return 'mc_' + require('crypto').createHash('sha256').update(JSON.stringify([ev.time, ev.action, ev.nodeid, ev.meshid, ev.userid, ev.etype, ev._n | 0])).digest('hex').substring(0, 20);
 }
 
 function isAuditRecord(ev) { return (ev.etype === undefined) && (typeof ev.action == 'string') && ev.action.startsWith('outband.'); }
