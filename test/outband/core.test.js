@@ -310,6 +310,8 @@ test('tokens: create, use per request, scopes, revoke, expiry, allowed_ips, TLS'
         r = await call(b, 'GET', '/api/v1/server', { bearer: secret });
         assert.strictEqual(r.body.error.code, 'token_revoked');
         delete h.dbDocs['user//alice'].passchange;
+        assert.strictEqual((await call(c, 'GET', '/api/v1/server')).status, 401, 'the password change also ended the session');
+        await c.login('alice', ALICE.password);
         // List, revoke
         r = await call(c, 'GET', '/api/v1/auth/tokens');
         assert.strictEqual(r.body.items.length, 1);
