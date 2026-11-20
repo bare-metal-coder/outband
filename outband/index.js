@@ -141,6 +141,7 @@ function create(webserver, parent, hooks, options) {
             parent.AddEventDispatch(['*'], {
                 HandleEvent: function (source, event) {
                     if ((event != null) && (event.action == 'accountremove') && (typeof event.userid == 'string')) { core.eraseUser(event.userid).catch(function () { }); }
+                    if ((event != null) && (event.action == 'removenode') && (typeof event.nodeid == 'string')) { core.store.amtpins.remove({ _id: event.nodeid }).catch(function () { }); } // a removed device's AMT pin goes too
                 }
             });
         }

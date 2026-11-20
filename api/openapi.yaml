@@ -963,6 +963,39 @@ paths:
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
         default: { $ref: '#/components/responses/DefaultError' }
 
+  /api/v1/admin/devices/{deviceId}/amt-pin:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    delete:
+      tags: [admin]
+      operationId: resetAmtPin
+      summary: Reset the pinned Intel AMT certificate of a device
+      description: |
+        Full site administrators, browser session only, with step-up
+        (`reauth_required` otherwise). Removes the server's pin of the
+        device's AMT certificate (see `createConsoleTicket`), so the next
+        console that opens pins the certificate it sees. Use it after a
+        legitimate certificate change, once the device has been checked.
+        Audited. `404` when no pin is stored for the device.
+      security:
+        - cookieSession: []
+      parameters:
+        - $ref: '#/components/parameters/XOutband'
+      responses:
+        '204':
+          description: Pin removed.
+          headers:
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
   /api/v1/admin/settings:
     get:
       tags: [admin]
@@ -1354,6 +1387,19 @@ paths:
         The server opens the stream through MeshCentral's own relay (AMT
         redirection for SOL), so AMT credentials never leave the server. A
         device has at most one SOL session at a time.
+
+        **AMT certificate.** Intel AMT presents a self-signed certificate.
+        The server pins it per device: from the certificate hash MeshCentral
+        stored, if any, otherwise on the first console that opens. The pin is
+        then enforced on every connection, even if MeshCentral's stored hash
+        changes. A certificate that does not match is refused (`4409`, state
+        reason `cert_changed`) and audited. A full site administrator can
+        reset the pin (`resetAmtPin`) after checking the device.
+
+        **Transport.** When a device's AMT redirection port is reached
+        without TLS (port 16994 on the local network), the digest exchange
+        and the keystrokes cross that network in clear. Configure AMT with
+        TLS (port 16995), or reach it over CIRA.
       parameters:
         - $ref: '#/components/parameters/XOutband'
       responses:

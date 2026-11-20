@@ -172,9 +172,9 @@ class SolClient extends EventEmitter {
 
 // ---- transports ---------------------------------------------------------------
 
-/** Accept an AMT TLS certificate only when it matches the hash MeshCentral stored for the device (when it has one). */
+/** True when a certificate matches a stored hash (SHA-1 fingerprint, SHA-256 or SHA-384 of the DER bytes). */
 function certMatches(cert, hash) {
-    if ((typeof hash != 'string') || (hash.length == 0)) return true;
+    if ((typeof hash != 'string') || (hash.length == 0)) return false;
     if ((cert == null) || (cert.raw == null)) return false;
     hash = hash.toLowerCase();
     if (typeof cert.fingerprint == 'string' && cert.fingerprint.split(':').join('').toLowerCase() == hash) return true;
@@ -183,20 +183,36 @@ function certMatches(cert, hash) {
     return false;
 }
 
+/**
+ * TLS options for Intel AMT. AMT presents a self-signed firmware certificate that
+ * cannot be validated against a CA, so chain validation is off; the peer
+ * certificate is pinned instead (see `verify` in createConsole: pinned on first
+ * use in Outband's own store and enforced on every connection).
+ */
 function amtTlsOptions() {
     const constants = require('constants');
-    // Intel AMT firmware only offers these; the certificate is pinned with certMatches.
     return { ciphers: 'RSA+AES:!aNULL:!MD5:!DSS', minVersion: 'TLSv1', secureOptions: constants.SSL_OP_NO_SSLv2 | constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_COMPRESSION | constants.SSL_OP_CIPHER_SERVER_PREFERENCE | constants.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION, rejectUnauthorized: false };
 }
 
-/** Wrap a socket-like stream into the transport interface. */
-function socketTransport(sock, openEvent, hash) {
+/**
+ * Wrap a socket-like stream into the transport interface. For TLS
+ * (`openEvent` 'secureConnect'), `verify(cert)` must resolve to true before
+ * anything is sent; otherwise the transport closes with `t.failure` set.
+ */
+function socketTransport(sock, openEvent, verify) {
     const t = new EventEmitter();
     let closed = false;
+    t.failure = null;
     const end = function () { if (closed) return; closed = true; try { sock.destroy(); } catch (ex) { } t.emit('close'); };
     sock.on(openEvent, function () {
-        if ((openEvent == 'secureConnect') && !certMatches(sock.getPeerCertificate(), hash)) { end(); return; }
-        t.emit('open');
+        if (openEvent != 'secureConnect') { t.emit('open'); return; }
+        if (typeof verify != 'function') { t.failure = 'cert_changed'; end(); return; }
+        let cert = null;
+        try { cert = sock.getPeerCertificate(); } catch (ex) { cert = null; }
+        Promise.resolve(verify(cert)).then(function (ok) {
+            if (closed) return;
+            if (ok === true) t.emit('open'); else { t.failure = 'cert_changed'; end(); }
+        }, function () { t.failure = 'error'; end(); });
     });
     sock.on('data', function (d) { if (!closed) t.emit('data', Buffer.isBuffer(d) ? d : Buffer.from(d, 'binary')); });
     sock.on('close', end);
@@ -207,8 +223,16 @@ function socketTransport(sock, openEvent, hash) {
     return t;
 }
 
-/** A CIRA channel (from MeshCentral's MPS server) as a transport, with TLS when the device requires it. */
-function ciraTransport(mps, ciraconn, hash) {
+/** Bytes waiting in a CIRA channel for credits from the device. */
+function channelBacklog(chnl) { return (chnl && chnl.sendBuffer) ? chnl.sendBuffer.length : 0; }
+
+/**
+ * A CIRA channel (from MeshCentral's MPS server) as a transport, with TLS when
+ * the device requires it. MeshCentral's channel buffers without limit while the
+ * device grants no credits, so writes are held until the channel reports the
+ * buffer sent (`onSendOk`), and `pending()` counts the channel's buffer too.
+ */
+function ciraTransport(mps, ciraconn, verify) {
     const plain = (ciraconn.tag.boundPorts.indexOf(16994) >= 0);
     const chnl = mps.SetupChannel(ciraconn, plain ? 16994 : 16995);
     if (plain) {
@@ -220,38 +244,63 @@ function ciraTransport(mps, ciraconn, hash) {
         chnl.onSendOk = function () { };
         t.write = function (b) { if (!closed) chnl.write(b); };
         t.close = end;
-        t.pending = function () { return chnl.sendBuffer ? chnl.sendBuffer.length : 0; };
+        t.pending = function () { return channelBacklog(chnl); };
         return t;
     }
     const { Duplex } = require('stream');
-    const tunnel = new Duplex({ read: function () { }, write: function (chunk, enc, cb) { chnl.write(chunk); cb(); } });
+    let held = null; // the write callback waiting for the channel to drain
+    const release = function () { if (held) { const cb = held; held = null; cb(); } };
+    const tunnel = new Duplex({
+        read: function () { },
+        write: function (chunk, enc, cb) {
+            chnl.write(chunk);
+            if (channelBacklog(chnl) > 0) held = cb; else cb();
+        }
+    });
     chnl.onData = function (c, data) { tunnel.push(Buffer.isBuffer(data) ? data : Buffer.from(data, 'binary')); };
-    chnl.onSendOk = function () { };
+    chnl.onSendOk = release;
     const tlsock = require('tls').connect(Object.assign({ socket: tunnel }, amtTlsOptions()));
-    const t = socketTransport(tlsock, 'secureConnect', hash);
+    const t = socketTransport(tlsock, 'secureConnect', verify);
     chnl.onStateChange = function (c, state) { if (state == 0) t.close(); };
     const close = t.close;
-    t.close = function () { try { chnl.close(); } catch (ex) { } close(); };
+    t.close = function () { held = null; try { chnl.close(); } catch (ex) { } close(); };
+    t.pending = function () { return (tlsock.writableLength || 0) + (tunnel.writableLength || 0) + channelBacklog(chnl); };
     return t;
 }
 
 /** MeshCentral's way to reach the device's AMT redirection port: CIRA first, then the local network. */
-function defaultConnect(core, node) {
+function defaultConnect(core, node, verify) {
     const parent = core.parent;
-    const hash = node.intelamt && node.intelamt.hash;
     const mps = parent.mpsserver;
     const ciraconn = (mps != null) ? mps.GetConnectionToNode(node._id, null, true) : null;
-    if (ciraconn != null) return ciraTransport(mps, ciraconn, hash);
+    if (ciraconn != null) return ciraTransport(mps, ciraconn, verify);
     const s = (typeof parent.GetConnectivityState == 'function') ? parent.GetConnectivityState(node._id) : null;
     if (s && ((s.connectivity & CONN.AMT) != 0) && (typeof node.host == 'string') && node.host) {
         if (node.intelamt.tls == 1) {
             const sock = require('tls').connect(Object.assign({ host: node.host, port: 16995 }, amtTlsOptions()));
-            return socketTransport(sock, 'secureConnect', hash);
+            return socketTransport(sock, 'secureConnect', verify);
         }
+        // Without TLS on the device, the redirection port carries the digest exchange and the keystrokes in clear.
         const sock = require('net').connect({ host: node.host, port: 16994 });
         return socketTransport(sock, 'connect', null);
     }
     return null;
+}
+
+/**
+ * Cap incoming frames at `max` bytes while they are received (also after
+ * permessage-deflate). The ws library has only a server-wide `maxPayload`, shared
+ * with MeshCentral's own WebSockets, so the per-connection limit is set on the
+ * receiver and the deflate extension. Written for ws 7.5 (bundled with
+ * express-ws 5.0.2, used by MeshCentral) and ws 8; test/outband/power.test.js
+ * checks it.
+ */
+function capFrames(wsock, max) {
+    try {
+        if (wsock._receiver && (typeof wsock._receiver._maxPayload == 'number')) wsock._receiver._maxPayload = max;
+        const pmd = wsock._extensions && wsock._extensions['permessage-deflate'];
+        if (pmd && (typeof pmd._maxPayload == 'number')) pmd._maxPayload = max;
+    } catch (ex) { }
 }
 
 // ---- sessions -------------------------------------------------------------------
@@ -272,6 +321,28 @@ function createConsole(core, deps) {
         if ((s != null) && (s !== forOpen)) throw new ApiError(409, 'busy', 'A console session is already open for this device');
         return node;
     }
+
+    /**
+     * The Outband pin for a device's AMT certificate. Seeded from the hash MeshCentral
+     * stored when there is one, otherwise from the first console that opens; after that
+     * it is enforced on every connection, whatever MeshCentral's current hash is. Only an
+     * administrator's reset (DELETE /api/v1/admin/devices/{id}/amt-pin) removes it.
+     */
+    async function verify(node, cert, session) {
+        if ((cert == null) || (cert.raw == null)) return false;
+        const pins = core.store.amtpins;
+        let pin = await pins.findOne({ _id: node._id });
+        if ((pin == null) && (typeof node.intelamt.hash == 'string') && (node.intelamt.hash.length > 0)) {
+            pin = { _id: node._id, hash: node.intelamt.hash.toLowerCase(), source: 'meshcentral', time: Date.now() };
+            try { await pins.insert(pin); } catch (ex) { pin = (await pins.findOne({ _id: node._id })) || pin; }
+        }
+        if (pin != null) return certMatches(cert, pin.hash);
+        session.firstUse = crypto.createHash('sha384').update(cert.raw).digest('hex');
+        return true;
+    }
+
+    /** Remove a device's pin; the next console that opens pins the certificate it sees. */
+    async function resetPin(nodeid) { return core.store.amtpins.remove({ _id: nodeid }); }
 
     async function target(ctx, deviceId, kind) {
         const node = await check(ctx, deviceId, kind, null);
@@ -303,9 +374,7 @@ function createConsole(core, deps) {
         if (busy.has(nodeid)) { try { wsock.close(4409); } catch (ex) { } return; }
         busy.set(nodeid, session);
 
-        // The frame limit applies while a frame is received, not after it was buffered (ws checks
-        // `_maxPayload` per frame; the server-wide default is much larger and serves MeshCentral).
-        try { if (wsock._receiver && (typeof wsock._receiver._maxPayload == 'number')) wsock._receiver._maxPayload = o.maxFrame; } catch (ex) { }
+        capFrames(wsock, o.maxFrame); // also set by the router before any check
         wsock.on('close', function () { finish(1000, null); });
         wsock.on('error', function () { finish(1011, 'error'); });
 
@@ -347,22 +416,35 @@ function createConsole(core, deps) {
             const node = await deps.visibleNode(ctx, binding.deviceId).catch(function () { return null; });
             if (closed) return;
             if ((node == null) || (node.intelamt == null) || (typeof node.intelamt.user != 'string') || (typeof node.intelamt.pass != 'string')) { finish(4409, 'unreachable'); return; }
-            try { transport = (typeof o.connect == 'function') ? o.connect(node) : defaultConnect(core, node); } catch (ex) { transport = null; }
+            const verifier = function (cert) { return verify(node, cert, session); };
+            try { transport = (typeof o.connect == 'function') ? o.connect(node, verifier) : defaultConnect(core, node, verifier); } catch (ex) { transport = null; }
             if (transport == null) { finish(4409, 'unreachable'); return; }
             sol = new SolClient(transport, node.intelamt.user, node.intelamt.pass);
             connectTimer = setTimeout(function () { if (sol.state != 1) finish(4409, 'unreachable'); }, o.connectTimeoutMs);
-            sol.on('open', function () { clearTimeout(connectTimer); lastActivity = Date.now(); state('open'); });
+            sol.on('open', function () {
+                clearTimeout(connectTimer); lastActivity = Date.now();
+                if (session.firstUse) { core.store.amtpins.insert({ _id: node._id, hash: session.firstUse, source: 'first_use', time: Date.now() }).catch(function () { }); session.firstUse = null; }
+                state('open');
+            });
             sol.on('data', function (d) {
                 if (closed) return;
                 lastActivity = Date.now();
                 if (wsock.bufferedAmount > o.maxClientBuffered) { finish(1008, 'backpressure'); return; }
                 try { wsock.send(d, { binary: true }); } catch (ex) { }
             });
-            sol.on('close', function () { finish(4409, 'device_closed'); });
+            sol.on('close', function () {
+                if (transport.failure == 'cert_changed') {
+                    core.audit.write({ domain: ctx.domain.id, type: 'node', action: 'outband.console.pin', outcome: 'denied', reason: 'cert_changed', user: ctx.userid, userName: ctx.user.name, tokenId: ctx.token && ctx.token._id, tokenName: ctx.token && ctx.token.name, deviceId: node._id, groupId: node.meshid, ip: ctx.ip, params: { kind: binding.kind } });
+                    console.log('Outband API: console refused for device ' + binding.deviceId + ': its Intel AMT certificate does not match the pinned one. A full site administrator can reset the pin after checking the device.');
+                    finish(4409, 'cert_changed');
+                    return;
+                }
+                finish(4409, 'device_closed');
+            });
         })().catch(function () { finish(1011, 'error'); });
     }
 
-    return { target: target, open: open, busy: busy };
+    return { target: target, open: open, busy: busy, resetPin: resetPin };
 }
 
-module.exports = { createConsole, SolClient, socketTransport, certMatches, DEFAULTS };
+module.exports = { createConsole, SolClient, socketTransport, ciraTransport, certMatches, capFrames, DEFAULTS };

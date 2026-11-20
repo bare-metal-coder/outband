@@ -34,6 +34,7 @@ const TEMPLATES = {
     'outband.power': { success: 'Power action "{power_action}" dispatched through {path}', denied: 'Power action "{power_action}" denied' },
     'outband.console.ticket': { success: 'Console ticket issued ({kind})', denied: 'Console ticket denied ({kind})' },
     'outband.console.open': { success: 'Console opened ({kind})', denied: 'Console open refused ({kind})' },
+    'outband.console.pin': { success: 'Device certificate pin reset', denied: 'Console refused: the device certificate does not match the pinned one' },
     'outband.not_found': { denied: 'Device not found' }
 };
 

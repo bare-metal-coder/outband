@@ -119,10 +119,13 @@ becomes unreachable or busy.
 
 `outband/console.js` implements SOL: one session per device, Intel AMT
 redirection opened by the server with the AMT credentials MeshCentral
-holds (CIRA through MeshCentral's MPS server, else the local network; a
-stored AMT certificate hash is checked), a frame limit, backpressure
-limits both ways, an idle timeout and a re-check every 2.5 seconds. Tests
-can replace the transport with `core.consoleOptions.connect(node)`.
+holds (CIRA through MeshCentral's MPS server, else the local network), an
+Outband-owned pin of each device's AMT certificate (store collection
+`amtpins`: seeded from MeshCentral's hash or the first console, enforced on
+every connection, reset only by `resetAmtPin`), a frame limit set before
+any upgrade check, backpressure limits both ways (CIRA writes wait for the
+channel's credits), an idle timeout and a re-check every 2.5 seconds.
+Tests can replace the transport with `core.consoleOptions.connect(node, verify)`.
 MeshCentral's WebSocket server calls `core.handleProtocols`, which answers
 only `outband.console.v1` under `/api/v1`, so the ticket subprotocol is
 never echoed.

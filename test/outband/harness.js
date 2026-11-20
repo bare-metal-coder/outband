@@ -113,7 +113,7 @@ async function start(o) {
         next();
     });
     const server = http.createServer(app);
-    require('express-ws')(app, server, { wsOptions: { handleProtocols: core.handleProtocols } }); // as MeshCentral's webserver does
+    require('express-ws')(app, server, { wsOptions: { perMessageDeflate: (o.wsCompression === true), handleProtocols: core.handleProtocols } }); // as MeshCentral's webserver does
     app.use('/api/v1', core.router());
     await new Promise(function (r) { server.listen(0, '127.0.0.1', r); });
     const port = server.address().port;

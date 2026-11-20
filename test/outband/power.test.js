@@ -560,7 +560,7 @@ test('console: MeshCentral CIRA channel transport (plain port), and the AMT cert
     const { certMatches } = require('../../outband/console');
     const raw = Buffer.from('example certificate bytes');
     const cert = { raw: raw, fingerprint: crypto.createHash('sha1').update(raw).digest('hex').toUpperCase().match(/../g).join(':') };
-    assert.strictEqual(certMatches(cert, null), true, 'no stored hash: accepted, as MeshCentral does');
+    assert.strictEqual(certMatches(cert, null), false, 'no hash matches nothing');
     assert.strictEqual(certMatches(cert, crypto.createHash('sha384').update(raw).digest('hex')), true);
     assert.strictEqual(certMatches(cert, crypto.createHash('sha256').update(raw).digest('hex')), true);
     assert.strictEqual(certMatches(cert, cert.fingerprint.split(':').join('').toLowerCase()), true);
@@ -581,37 +581,160 @@ function selfSigned() {
     return { key: forge.pki.privateKeyToPem(keys.privateKey), cert: forge.pki.certificateToPem(cert), sha384: crypto.createHash('sha384').update(der).digest('hex') };
 }
 
-test('console: CIRA with TLS (redirection port 16995): the stored certificate hash is enforced', async function () {
-    const cert = selfSigned();
-    const amt = await fakeAmt(AMT_USER, AMT_PASS, { key: cert.key, cert: cert.cert });
+/** A CIRA connection as MeshCentral's MPS server exposes it, carried over a local socket to the fake AMT. `stall()` stops granting credits. */
+function fakeMps(getPort, boundPorts) {
+    const m = { channels: [], stalled: false };
+    m.GetConnectionToNode = function () { return { tag: { boundPorts: boundPorts } }; };
+    m.SetupChannel = function (conn, port) {
+        m.port = port;
+        const sock = net.connect(getPort(), '127.0.0.1');
+        const chnl = { state: 1 };
+        chnl.write = function (d) {
+            if (chnl.state == 0) return false;
+            if (typeof d == 'string') d = Buffer.from(d, 'binary');
+            if (m.stalled || (chnl.sendBuffer != null)) { chnl.sendBuffer = (chnl.sendBuffer == null) ? d : Buffer.concat([chnl.sendBuffer, d]); return true; } // as mpsserver does without credits
+            sock.write(d); return true;
+        };
+        chnl.close = function () { if (chnl.state == 0) return; chnl.state = 0; sock.destroy(); if (chnl.onStateChange) chnl.onStateChange(chnl, 0); };
+        sock.on('connect', function () { chnl.state = 2; if (chnl.onStateChange) chnl.onStateChange(chnl, 2); });
+        sock.on('data', function (d) { if (chnl.onData) chnl.onData(chnl, d); });
+        sock.on('close', function () { chnl.close(); });
+        sock.on('error', function () { });
+        m.channels.push(chnl);
+        return chnl;
+    };
+    return m;
+}
+
+test('console: the AMT certificate is pinned on first use and enforced; only an admin reset moves the pin', async function () {
+    const certA = selfSigned(), certB = selfSigned();
+    let amt = await fakeAmt(AMT_USER, AMT_PASS, { key: certA.key, cert: certA.cert });
     try {
         await withWorld(async function (h) {
-            h.parent.mpsserver = {
-                GetConnectionToNode: function () { return { tag: { boundPorts: [16993, 16995] } }; },
-                SetupChannel: function (conn, port) {
-                    assert.strictEqual(port, 16995);
-                    const sock = net.connect(amt.port, '127.0.0.1');
-                    const chnl = { state: 1, write: function (d) { sock.write(d); return true; }, close: function () { if (chnl.state == 0) return; chnl.state = 0; sock.destroy(); if (chnl.onStateChange) chnl.onStateChange(chnl, 0); } };
-                    sock.on('connect', function () { chnl.state = 2; if (chnl.onStateChange) chnl.onStateChange(chnl, 2); });
-                    sock.on('data', function (d) { chnl.onData(chnl, d); });
-                    sock.on('close', function () { chnl.close(); });
-                    sock.on('error', function () { });
-                    return chnl;
-                }
-            };
+            h.parent.mpsserver = fakeMps(function () { return amt.port; }, [16993, 16995]);
             const c = await session(h, 'alice');
-            h.dbDocs[FN1].intelamt.hash = cert.sha384;
-            let s = await openWs(h, protocolsOf(await ticketFor(h, { client: c })), { client: c });
-            assert.ok(await s.waitFor(function (x) { return x.states.some(function (m) { return m.state == 'open'; }); }), JSON.stringify(s.states));
-            s.ws.send(Buffer.from('tls'));
-            assert.ok(await s.waitFor(function (x) { return x.frames.join('').includes('TLS'); }));
-            s.ws.close(); await s.closed(); await sleep(50);
-            // another certificate than the one MeshCentral stored: refused before any credential is sent
-            h.dbDocs[FN1].intelamt.hash = crypto.createHash('sha384').update('another certificate').digest('hex');
-            amt.auth = false;
-            s = await openWs(h, protocolsOf(await ticketFor(h, { client: c })), { client: c });
-            assert.ok(await s.closed(5000)); assert.strictEqual(s.closeCode, 4409);
-            assert.strictEqual(amt.auth, false);
+            const openOnce = async function () {
+                const s = await openWs(h, protocolsOf(await ticketFor(h, { client: c })), { client: c });
+                const ok = await s.waitFor(function (x) { return x.closeCode != null || x.states.some(function (m) { return m.state == 'open'; }); });
+                assert.ok(ok);
+                const opened = s.states.some(function (m) { return m.state == 'open'; });
+                if (opened) { s.ws.close(); await s.closed(); await sleep(50); }
+                return { opened: opened, s: s };
+            };
+            // first use: no hash from MeshCentral, the certificate is pinned when the console opens
+            assert.strictEqual(h.parent.mpsserver.port === undefined, true);
+            let r = await openOnce();
+            assert.ok(r.opened); assert.strictEqual(h.parent.mpsserver.port, 16995);
+            await sleep(20);
+            let pin = await h.core.store.amtpins.findOne({ _id: FN1 });
+            assert.strictEqual(pin.hash, certA.sha384); assert.strictEqual(pin.source, 'first_use');
+            // the same certificate again
+            assert.ok((await openOnce()).opened);
+            // MeshCentral's stored hash changing does not move the Outband pin
+            h.dbDocs[FN1].intelamt.hash = certB.sha384;
+            assert.ok((await openOnce()).opened, 'still the pinned certificate A');
+            assert.strictEqual((await h.core.store.amtpins.findOne({ _id: FN1 })).hash, certA.sha384);
+            // the device now presents another certificate: refused before any credential is sent, audited
+            await amt.close();
+            amt = await fakeAmt(AMT_USER, AMT_PASS, { key: certB.key, cert: certB.cert });
+            const logs = [], log = console.log; console.log = function (...a) { logs.push(a.join(' ')); };
+            try { r = await openOnce(); } finally { console.log = log; }
+            assert.ok(!r.opened); assert.ok(await r.s.closed()); assert.strictEqual(r.s.closeCode, 4409);
+            assert.strictEqual(r.s.states.pop().reason, 'cert_changed');
+            assert.strictEqual(amt.auth, false, 'no digest exchange with the unknown certificate');
+            await sleep(20);
+            const au = await h.core.store.audit.find({ action: 'outband.console.pin', outcome: 'denied' });
+            assert.strictEqual(au.length, 1); assert.strictEqual(au[0].reason, 'cert_changed'); assert.strictEqual(au[0].group_id, MA);
+            assert.ok(!JSON.stringify(au[0]).includes(AMT_PASS));
+            assert.ok(logs.some(function (l) { return /certificate does not match the pinned one/.test(l) && !l.includes(AMT_PASS); }));
+            // the admin reset: full site admin, browser session; then the next console pins certificate B
+            const nonAdmin = await call(c, 'DELETE', '/api/v1/admin/devices/' + N1 + '/amt-pin');
+            assert.strictEqual(nonAdmin.status, 403);
+            const t = await token(h, 'admin', { scopes: ['read'] });
+            assert.strictEqual((await call(h.client(), 'DELETE', '/api/v1/admin/devices/' + N1 + '/amt-pin', bearer(t))).status, 403, 'browser session only');
+            const adm = await session(h, 'admin');
+            assert.strictEqual((await call(adm, 'DELETE', '/api/v1/admin/devices/' + N1 + '/amt-pin')).status, 204);
+            assert.strictEqual((await call(adm, 'DELETE', '/api/v1/admin/devices/' + N1 + '/amt-pin')).status, 404);
+            assert.strictEqual((await call(adm, 'DELETE', '/api/v1/admin/devices/bad/amt-pin')).status, 400);
+            await sleep(20);
+            assert.strictEqual((await h.core.store.audit.find({ action: 'outband.console.pin', outcome: 'success' })).length, 1);
+            // after a reset, MeshCentral's current hash (B) seeds the pin; certificate B is accepted
+            assert.ok((await openOnce()).opened);
+            pin = await h.core.store.amtpins.findOne({ _id: FN1 });
+            assert.strictEqual(pin.hash, certB.sha384); assert.strictEqual(pin.source, 'meshcentral');
+            // a seeded pin that does not match is refused as well
+            await h.core.store.amtpins.update({ _id: FN1 }, { $set: { hash: certA.sha384 } });
+            r = await openOnce();
+            assert.ok(!r.opened); assert.strictEqual(r.s.closeCode, 4409);
         });
     } finally { await amt.close(); }
+});
+
+test('console: a device that grants no CIRA credits cannot make the server buffer without limit (plain and TLS)', async function () {
+    for (const tls of [false, true]) {
+        const cert = tls ? selfSigned() : null;
+        const amt = await fakeAmt(AMT_USER, AMT_PASS, tls ? { key: cert.key, cert: cert.cert } : undefined);
+        try {
+            await withWorld(async function (h) {
+                h.core.consoleOptions = { maxDeviceBuffered: 256 * 1024 };
+                const mps = fakeMps(function () { return amt.port; }, tls ? [16995] : [16994]);
+                h.parent.mpsserver = mps;
+                const c = await session(h, 'alice');
+                const s = await openWs(h, protocolsOf(await ticketFor(h, { client: c })), { client: c });
+                assert.ok(await s.waitFor(function (x) { return x.states.some(function (m) { return m.state == 'open'; }); }), 'tls=' + tls + ' ' + JSON.stringify(s.states));
+                mps.stalled = true;
+                const frame = Buffer.alloc(16000, 0x61);
+                let sent = 0;
+                while ((s.closeCode == null) && (sent < 400)) { s.ws.send(frame); sent++; if (sent % 8 == 0) await sleep(5); }
+                assert.ok(await s.closed(5000)); assert.strictEqual(s.closeCode, 1008, 'tls=' + tls);
+                const backlog = mps.channels[0].sendBuffer ? mps.channels[0].sendBuffer.length : 0;
+                assert.ok(backlog <= 256 * 1024 + 64 * 1024, 'channel backlog bounded: ' + backlog);
+                assert.ok(sent < 400, 'closed at the limit, after ' + sent + ' frames');
+            });
+        } finally { await amt.close(); }
+    }
+});
+
+test('console: frames over the cap close 1009 also with permessage-deflate, and before the upgrade checks finish', async function () {
+    const amt = await fakeAmt(AMT_USER, AMT_PASS);
+    try {
+        await withWorld(async function (h) {
+            h.core.consoleOptions = { connect: function () { return socketTransport(net.connect(amt.port, '127.0.0.1'), 'connect', null); } };
+            const c = await session(h, 'alice');
+            // compressed: 1 MiB of zeros is a few KiB on the wire, the cap applies to the inflated size
+            let s = await openWs(h, protocolsOf(await ticketFor(h, { client: c })), { client: c });
+            assert.ok(s.ws.extensions.includes('permessage-deflate'), 'deflate negotiated');
+            await s.waitFor(function (x) { return x.states.some(function (m) { return m.state == 'open'; }); });
+            s.ws.send(Buffer.alloc(1 << 20));
+            assert.ok(await s.closed(3000));
+            // inflating stops at the cap; ws 7.5 (express-ws 5.0.2) reports it as 1009 or, when zlib errors on the cut stream, 1007
+            assert.ok([1007, 1009].includes(s.closeCode), String(s.closeCode));
+            // an oversize frame sent at once, while the ticket and credential checks are still running
+            await sleep(50);
+            const t = await ticketFor(h, { client: c });
+            const target = h.core.resources.consoleTarget;
+            h.core.resources.consoleTarget = async function (ctx, id, kind) { await sleep(1500); return target(ctx, id, kind); }; // slow upgrade checks
+            const t0 = Date.now();
+            const w = new WebSocket('ws://127.0.0.1:' + h.port + '/api/v1/devices/' + N1 + '/console/sol', protocolsOf(t), { headers: { host: NAME, cookie: c.cookieHeader(), origin: ORIGIN }, perMessageDeflate: false });
+            const code = await new Promise(function (resolve) { w.on('open', function () { w.send(Buffer.alloc(100000, 0x62)); }); w.on('close', resolve); w.on('error', function () { }); });
+            assert.strictEqual(code, 1009);
+            assert.ok(Date.now() - t0 < 1000, 'refused while the checks were still running');
+            h.core.resources.consoleTarget = target;
+        }, { wsCompression: true });
+    } finally { await amt.close(); }
+});
+
+test('power: concurrent requests with the same Idempotency-Key dispatch once', async function () {
+    await withWorld(async function (h) {
+        const c = await session(h, 'alice');
+        const key = { headers: { 'idempotency-key': 'example-race-key-0001' } };
+        const rs = await Promise.all([0, 1, 2, 3].map(function () { return powerOf(h, c, N1, { action: 'off' }, key); }));
+        assert.ok(rs.every(function (r) { return r.status == 202; }), JSON.stringify(rs.map(function (r) { return r.status; })));
+        assert.ok(rs.every(function (r) { return r.body.action_id == rs[0].body.action_id; }));
+        assert.strictEqual(h.sent.length, 1, 'dispatched once');
+        // a concurrent request with another body gets the conflict
+        const [a, b] = await Promise.all([powerOf(h, c, N1, { action: 'reset' }, { headers: { 'idempotency-key': 'example-race-key-0002' } }), powerOf(h, c, N1, { action: 'sleep' }, { headers: { 'idempotency-key': 'example-race-key-0002' } })]);
+        assert.deepStrictEqual([a.status, b.status].sort(), [202, 409]);
+        assert.strictEqual(h.sent.length, 2);
+    });
 });
