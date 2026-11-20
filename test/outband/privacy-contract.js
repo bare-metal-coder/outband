@@ -40,16 +40,19 @@ function fakeCore() {
     };
 }
 
-/** Build a spied context. kind: 'session-admin' | 'session-user' | 'token-read' | 'token-console' | 'token-audit-admin' */
+/**
+ * Build a spied context. kind: 'session-admin' | 'session-user' | 'token-read' | 'token-console' | 'token-audit-admin'
+ * | 'token-audit-admin-restricted' (full admin, `audit` scope, restricted to one group).
+ */
 function makeCtx(kind) {
     const core = fakeCore();
-    const admin = (kind == 'session-admin') || (kind == 'token-audit-admin');
+    const admin = (kind == 'session-admin') || (kind == 'token-audit-admin') || (kind == 'token-audit-admin-restricted');
     const user = { _id: 'user//viewer', type: 'user', name: 'viewer', siteadmin: admin ? FULL : 0, links: {} };
     const isToken = kind.startsWith('token');
     const scopes = isToken ? (kind == 'token-read' ? ['read'] : kind == 'token-console' ? ['read', 'console'] : ['read', 'audit']) : ['read', 'power_on', 'power_off', 'console', 'identity', 'audit'];
     const ctx = new AuthContext(core, {
         domain: { id: '' }, user: user, method: isToken ? 'token' : 'cookie', scopes: scopes,
-        token: isToken ? { _id: 'tok_viewer', groups: null, scopes: scopes } : null,
+        token: isToken ? { _id: 'tok_viewer', groups: (kind == 'token-audit-admin-restricted') ? ['OtherGroup'] : null, scopes: scopes } : null,
         session: isToken ? null : { u: user._id, x: 'X', ia: Date.now(), la: Date.now(), la2: null },
         credentialKey: isToken ? 'tok:tok_viewer' : 'ses:user//viewer/X', ip: '127.0.0.1'
     });
@@ -118,7 +121,7 @@ async function runPrivacyContract(mappers) {
     }
 
     // Events, as a caller without identities or source_ip
-    for (const kind of ['token-read', 'session-user']) {
+    for (const kind of ['token-read', 'session-user', 'token-console', 'token-audit-admin-restricted']) {
         for (const [label, ev] of [['MeshCentral event', f.mcEvent], ['audit record', f.audit]]) {
             const ctx = makeCtx(kind);
             const auditCalls = { n: 0 };
@@ -133,13 +136,21 @@ async function runPrivacyContract(mappers) {
             if (!ctx.calls.seesSourceIp) v.push('mapEvent (' + kind + ', ' + label + '): did not consult ctx.seesSourceIp()');
             if (!ctx.calls.seesIdentities) v.push('mapEvent (' + kind + ', ' + label + '): did not consult ctx.seesIdentities()');
             if (label == 'audit record' && auditCalls.n == 0) v.push('mapEvent (' + kind + '): audit message not built with Audit.message');
-            if (kind == 'token-read') {
+            if ((kind == 'token-read') || (kind == 'token-console')) {
                 if (contains(e, SECRET.userid) || contains(e, '"' + SECRET.username + '"') || contains(e, SECRET.tokenName) || contains(e, SECRET.tokenId)) v.push('mapEvent (' + kind + ', ' + label + '): real identity shown');
                 if (!e.user || (e.user.redacted !== true) || (e.user.name !== null) || (e.user.id !== ctx.pseudonymUser(SECRET.userid))) v.push('mapEvent (' + kind + ', ' + label + '): user must be the ctx.pseudonymUser pseudonym');
                 if ((label == 'audit record') && (e.token_id !== ctx.pseudonymToken(SECRET.tokenId))) v.push('mapEvent (' + kind + '): token_id must be the ctx.pseudonymToken pseudonym');
             }
             if (/(^|[^a-z])msg|login from/i.test(e.message || '') && contains(e.message, SECRET.ip)) v.push('mapEvent: free text passed through');
         }
+    }
+    // A group-restricted full admin with `audit` sees real names but never source_ip
+    {
+        const r = makeCtx('token-audit-admin-restricted');
+        const er = await call(mappers.mapEvent, r, f.audit);
+        if (er && (!er.user || er.user.name !== SECRET.username || er.user.redacted !== false)) v.push('mapEvent (token-audit-admin-restricted): real user name missing for an audit-scoped token');
+        if (er && (er.source_ip != null)) v.push('mapEvent (token-audit-admin-restricted): source_ip shown through a group-restricted token');
+        if (r.seesSourceIp()) v.push('seesSourceIp() is true for a group-restricted token');
     }
     // Events, as a full admin session: source_ip and real names are shown
     const adm = makeCtx('session-admin');

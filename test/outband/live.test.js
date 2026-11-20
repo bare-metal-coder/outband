@@ -259,6 +259,119 @@ liveTest('live MeshCentral', { timeout: 900000 }, async function (t) {
     });
 });
 
+/** Add a device group, one device and a user link to a prepared data directory (NeDB: the last line per _id wins). */
+function seedInventory(dir) {
+    const dbFile = path.join(dir, 'meshcentral.db');
+    const lines = fs.readFileSync(dbFile, 'utf8').split('\n').filter(Boolean).map(function (l) { return JSON.parse(l); });
+    const alice = lines.filter(function (d) { return d._id == 'user//alice'; }).pop();
+    const meshId = 'mesh//LiveGroup0000000000000000000000000000000000000000000000000000';
+    const nodeId = 'node//LiveNode00000000000000000000000000000000000000000000000000000';
+    alice.links = { [meshId]: { rights: 0xFFFFFFFF } };
+    const mesh = { type: 'mesh', _id: meshId, name: 'Live Group', mtype: 2, desc: 'Example group', domain: '', links: { 'user//alice': { name: 'alice', rights: 0xFFFFFFFF } } };
+    const node = { type: 'node', _id: nodeId, meshid: meshId, name: 'live-node-01', host: 'live-node-01.example.com', domain: '', ip: '192.0.2.50', osdesc: 'Example OS', icon: 1, agent: { ver: 1, id: 6 }, intelamt: { state: 2, ver: '16.1.25' } };
+    for (const d of [alice, mesh, node]) fs.appendFileSync(dbFile, JSON.stringify(d) + '\n');
+    return { group: meshId.split('/')[2], device: nodeId.split('/')[2] };
+}
+
+/** Open the SSE stream over TLS; resolves with the status and a message list. */
+function sse(o) {
+    return new Promise(function (resolve, reject) {
+        const headers = { host: HOST };
+        if (o.cookie) headers.cookie = o.cookie;
+        if (o.bearer) headers.authorization = 'Bearer ' + o.bearer;
+        const req = https.request({ host: '127.0.0.1', port: PORT, servername: NAME, method: 'GET', path: '/api/v1/stream' + (o.query || ''), headers: headers, ca: fs.readFileSync(path.join(o.dir, 'root-cert-public.crt')), agent: false }, function (res) {
+            const s = { status: res.statusCode, headers: res.headers, raw: '', messages: [], ended: false, close: function () { req.destroy(); } };
+            let buf = '';
+            res.setEncoding('utf8');
+            res.on('data', function (d) {
+                s.raw += d; buf += d;
+                let i;
+                while ((i = buf.indexOf('\n\n')) >= 0) {
+                    const block = buf.substring(0, i); buf = buf.substring(i + 2);
+                    const m = /^data: (.*)$/m.exec(block);
+                    if (m) s.messages.push(JSON.parse(m[1]));
+                }
+            });
+            res.on('end', function () { s.ended = true; });
+            res.on('close', function () { s.ended = true; });
+            s.waitFor = async function (pred, ms) { const until = Date.now() + (ms || 8000); while (Date.now() < until) { if (pred(s)) return true; await new Promise(function (r) { setTimeout(r, 25); }); } return pred(s); };
+            resolve(s);
+        });
+        req.on('error', reject);
+        req.end();
+    });
+}
+
+liveTest('live MeshCentral resources: groups, devices, events, stream', { timeout: 900000 }, async function (t) {
+    const env = prepare('live-resources');
+    const ids = seedInventory(env.dir);
+    t.after(stopServer);
+    await startServer(env.dir);
+    cacheCerts(env.dir);
+    const login = async function (name) { const r = await api('POST', '/api/v1/auth/login', { csrf: true, json: { username: name, password: PASS[name] } }); assert.strictEqual(r.status, 200, r.text); return r.cookie; };
+    const alice = await login('alice');
+    const bob = await login('bob').catch(function () { return null; });
+
+    await t.test('groups and devices as the owner of the links', async function () {
+        const g = await api('GET', '/api/v1/groups', { cookie: alice });
+        assert.strictEqual(g.status, 200);
+        assert.deepStrictEqual(g.body.items.map(function (x) { return [x.id, x.name, x.kind, x.device_count]; }), [[ids.group, 'Live Group', 'agent', 1]]);
+        assert.deepStrictEqual(g.body.items[0].rights, { mask: 4294967295, names: ['admin'] });
+        assert.strictEqual((await api('GET', '/api/v1/groups/' + ids.group, { cookie: alice })).status, 200);
+        const d = await api('GET', '/api/v1/devices', { cookie: alice });
+        assert.strictEqual(d.status, 200);
+        assert.strictEqual(d.body.items.length, 1);
+        const dev = d.body.items[0];
+        assert.strictEqual(dev.id, ids.device); assert.strictEqual(dev.online, false); assert.deepStrictEqual(dev.ips, ['192.0.2.50']);
+        assert.strictEqual(dev.amt.state, 'provisioned'); assert.strictEqual(dev.group.id, ids.group);
+        assert.strictEqual((await api('GET', '/api/v1/devices?status=online', { cookie: alice })).body.items.length, 0);
+        assert.strictEqual((await api('GET', '/api/v1/devices?q=LIVE-NODE', { cookie: alice })).body.items.length, 1);
+        const one = await api('GET', '/api/v1/devices/' + ids.device, { cookie: alice });
+        assert.strictEqual(one.status, 200); assert.strictEqual(one.body.agent.type, 6);
+        assert.strictEqual((await api('GET', '/api/v1/devices/' + ids.device + '/events', { cookie: alice })).status, 200);
+        assert.strictEqual((await api('GET', '/api/v1/events', { cookie: alice })).status, 200);
+    });
+
+    await t.test('a user without links sees nothing; tokens follow their scopes and groups', async function () {
+        const adminCookie = await login('admin');
+        assert.strictEqual((await api('GET', '/api/v1/devices/' + ids.device, { cookie: adminCookie })).status, 404);
+        assert.strictEqual((await api('GET', '/api/v1/groups/' + ids.group, { cookie: adminCookie })).status, 404);
+        assert.deepStrictEqual((await api('GET', '/api/v1/devices', { cookie: adminCookie })).body.items, []);
+        const tk = await api('POST', '/api/v1/auth/tokens', { csrf: true, cookie: alice, json: { name: 'live-power', profile: 'device_power', groups: [ids.group] } });
+        assert.strictEqual(tk.status, 201, tk.text);
+        const dd = await api('GET', '/api/v1/devices/' + ids.device, { bearer: tk.body.secret });
+        assert.strictEqual(dd.status, 200);
+        assert.ok(!('ips' in dd.body)); assert.ok(!dd.text.includes('192.0.2.50'));
+        const ev = await api('GET', '/api/v1/events?limit=5', { bearer: tk.body.secret });
+        assert.strictEqual(ev.status, 200);
+        assert.ok(ev.body.items.every(function (e) { return !e.user || e.user.redacted === true; }));
+        assert.ok(ev.body.items.every(function (e) { return e.source_ip == null; }));
+        assert.strictEqual((await api('GET', '/api/v1/devices/' + ids.device + 'x', { bearer: tk.body.secret })).status, 404);
+    });
+
+    await t.test('stream: ready, and it ends with closed within 5 seconds of a revocation', async function () {
+        const tk = await api('POST', '/api/v1/auth/tokens', { csrf: true, cookie: alice, json: { name: 'live-stream', scopes: ['read'] } });
+        const s = await sse({ dir: env.dir, bearer: tk.body.secret, query: '?types=device.power,device.updated,resync' });
+        assert.strictEqual(s.status, 200);
+        assert.match(s.headers['content-type'], /^text\/event-stream/);
+        assert.ok(await s.waitFor(function (x) { return x.messages.some(function (m) { return m.type == 'ready'; }); }));
+        assert.ok(s.raw.startsWith('retry: 5000'));
+        const t0 = Date.now();
+        const del = await api('DELETE', '/api/v1/auth/tokens/' + tk.body.token.id, { csrf: true, cookie: alice });
+        assert.strictEqual(del.status, 204);
+        assert.ok(await s.waitFor(function (x) { return x.messages.some(function (m) { return m.type == 'closed'; }); }, 5000));
+        assert.ok(Date.now() - t0 < 5000);
+        assert.strictEqual(s.messages.filter(function (m) { return m.type == 'closed'; })[0].data.reason, 'revoked');
+        // a session stream ends on logout, and frees its slot
+        const c2 = await login('alice');
+        const s2 = await sse({ dir: env.dir, cookie: c2 });
+        assert.ok(await s2.waitFor(function (x) { return x.messages.length > 0; }));
+        await api('POST', '/api/v1/auth/logout', { csrf: true, cookie: c2 });
+        assert.ok(await s2.waitFor(function (x) { return x.messages.some(function (m) { return m.type == 'closed' && m.data.reason == 'logout'; }); }, 5000));
+        void bob;
+    });
+});
+
 liveTest('live MeshCentral in no-auth mode answers 503', { timeout: 600000 }, async function (t) {
     const env = prepare('live-nousers');
     t.after(stopServer);

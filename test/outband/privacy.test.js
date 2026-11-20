@@ -68,8 +68,8 @@ test('privacy contract: mappers that ignore the helpers are caught', async funct
     assert.ok(v.some((x) => /did not consult/.test(x)));
 });
 
-test('privacy contract: outband/mappers.js (the resources implementation) complies', async function (t) {
+test('privacy contract: outband/mappers.js (the resources implementation) complies', async function () {
     const p = path.join(__dirname, '../../outband/mappers.js');
-    if (!fs.existsSync(p)) { t.diagnostic('outband/mappers.js not present yet; the resources implementation must add it'); return; }
+    assert.ok(fs.existsSync(p), 'outband/mappers.js is required: every Device, Group and Event payload goes through it');
     assert.deepStrictEqual(await runPrivacyContract(require(p)), []);
 });

@@ -137,7 +137,7 @@ their own rules:
 
 | Field | Helper |
 |---|---|
-| `ips`, `hardware.serial` | `ctx.seesDeviceAddresses()` |
+| `ips`, `hardware.serial`, `host` when it is an IP literal | `ctx.seesDeviceAddresses()` |
 | user and token names; otherwise `ctx.pseudonymUser(userid)` / `ctx.pseudonymToken(tokenId)` | `ctx.seesIdentities()` |
 | `source_ip`, and `ip` / `email` message parameters | `ctx.seesSourceIp()` |
 | Outband audit record messages | `Audit.message(doc)` |
@@ -178,3 +178,30 @@ Use `test/outband/harness.js` (in-process server with a fake MeshCentral)
 and `test/outband/contract.js` (`check(method, path, response)` validates
 status, headers and body against the spec). Every new endpoint needs
 contract tests and tests for its refusals.
+
+## Reference implementation (groups, devices, events, stream)
+
+* `outband/mappers.js`: every Device, DeviceDetail, Group and Event payload.
+* `outband/devices.js`: `createResources(core)`; wired in `outband/index.js`
+  with the power and console methods left as `not_implemented` stubs.
+* `outband/events.js`: one event visibility rule (`eventVisible`) shared by
+  `/events`, `/devices/{id}/events` and `/stream`.
+* `outband/hub.js` and `outband/stream.js`: the live feed (MeshCentral state
+  changes and Outband audit records, kept 5 minutes) and the SSE endpoint.
+* A device's `capabilities` come from `outband/power.js` and the mappers
+  (`mapCapabilities`); nothing is dispatched when a device is read.
+
+For the power lane: `nodeInfo` in `outband/devices.js` builds the per-device
+facts (connectivity, group kind, rights, Wake-on-LAN peers) that the
+`power.plan` environment needs; `core.audit.write` feeds the stream, so a
+power audit record appears as an `event.created` message without extra code.
+
+Device `name`, `description` and `tags`, and group `name` and `description`,
+are visible to every caller that can see the device or group (scope `read`);
+they are set by the group's administrators and are not treated as private.
+
+Event listings read a bounded amount per request (see `collect` in
+`outband/events.js`): the cursor is a scan position and a page can be short
+while `next_cursor` is set. `/events` and `/devices/{id}/events` have their
+own limiter (30 per minute per credential), and streams have a server-wide
+cap besides the per-credential one.

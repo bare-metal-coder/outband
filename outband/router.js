@@ -30,7 +30,7 @@ function optTime(q, field) {
     if ((d == null) || isNaN(d.getTime()) || !/^\d{4}-\d{2}-\d{2}T/.test(q[field])) throw new ApiError(400, 'invalid_request', 'Invalid ' + field, { field: field });
     return d;
 }
-function sendPage(res, r) { res.json({ items: r.items, next_cursor: r.next ? encodeCursor(r.next) : null }); }
+function sendPage(res, r) { const b = { items: r.items, next_cursor: r.next ? encodeCursor(r.next) : null }; if (r.truncated === true) b.truncated = true; res.json(b); }
 function pageArgs(q) { return { limit: parseLimit(q), cursor: decodeCursor(q.cursor) }; }
 
 function buildRouter(core) {
@@ -129,11 +129,17 @@ function buildRouter(core) {
         if (key !== undefined) { await core.idempotency.save(ctx.credentialKey, key, 'power:' + deviceId, body, 202, result); }
         res.status(202).json(result);
     }));
+    const eventLimit = function (ctx) {
+        const lim = core.limits.events.hit(ctx.credentialKey);
+        if (!lim.allowed) throw new ApiError(429, 'rate_limited', 'Too many event reads', null, { 'Retry-After': String(lim.resetSec) });
+    };
     router.get('/devices/:deviceId/events', R({ auth: 'required' }, async function (req, res, ctx) {
+        eventLimit(ctx);
         const a = pageArgs(req.query); a.since = optTime(req.query, 'since'); a.until = optTime(req.query, 'until');
         sendPage(res, await res_().listDeviceEvents(ctx, checkId(req.params.deviceId, 'deviceId'), a));
     }));
     router.get('/events', R({ auth: 'required' }, async function (req, res, ctx) {
+        eventLimit(ctx);
         const q = req.query, a = pageArgs(q);
         a.device = optId(q, 'device'); a.group = optId(q, 'group'); a.since = optTime(q, 'since'); a.until = optTime(q, 'until');
         if (q.type !== undefined) { if ((typeof q.type != 'string') || (q.type.length > 32)) throw new ApiError(400, 'invalid_request', 'Invalid type', { field: 'type' }); a.type = q.type; }
@@ -197,8 +203,11 @@ function buildRouter(core) {
         let last = req.headers['last-event-id'];
         if (last === undefined) last = q.last_event_id;
         if ((last !== undefined) && ((typeof last != 'string') || (last.length > 64))) throw new ApiError(400, 'invalid_request', 'Invalid last event id', { field: 'last_event_id' });
-        const release = core.limits.streams.acquire(ctx.credentialKey);
-        if (release == null) throw new ApiError(429, 'rate_limited', 'Too many concurrent streams', null, { 'Retry-After': '5' });
+        const releaseTotal = core.limits.streamsTotal.acquire('all');
+        if (releaseTotal == null) throw new ApiError(429, 'rate_limited', 'Too many concurrent streams on this server', null, { 'Retry-After': '5' });
+        const releaseCred = core.limits.streams.acquire(ctx.credentialKey);
+        if (releaseCred == null) { releaseTotal(); throw new ApiError(429, 'rate_limited', 'Too many concurrent streams', null, { 'Retry-After': '5' }); }
+        const release = function () { releaseCred(); releaseTotal(); };
         res.on('close', release);
         try { await res_().stream(ctx, req, res, { types: types, lastEventId: (last === undefined) ? null : last }); }
         catch (ex) { release(); throw ex; }

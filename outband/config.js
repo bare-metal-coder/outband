@@ -25,6 +25,8 @@ function readConfig(parent) {
             requestsPerMinute: num(rl.requestsperminute, 600, 1),
             powerPerMinute: num(rl.powerperminute, 30, 1),
             streams: num(rl.streams, 5, 1),
+            streamsTotal: num(rl.streamstotal, 500, 1),
+            eventsPerMinute: num(rl.eventsperminute, 30, 1),
             devicePowerPerMinute: num(rl.devicepowerperminute, 6, 1),
             invalidBearer: num(rl.invalidbearer, 30, 1),
             invalidBearerWindowMinutes: num(rl.invalidbearerwindowminutes, 10, 1),

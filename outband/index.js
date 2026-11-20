@@ -58,6 +58,8 @@ function create(webserver, parent, hooks, options) {
         action: new WindowLimiter(rl.powerPerMinute, 60000),
         device: new WindowLimiter(rl.devicePowerPerMinute, 60000),
         streams: new ConcurrencyLimiter(rl.streams),
+        streamsTotal: new ConcurrencyLimiter(rl.streamsTotal),
+        events: new WindowLimiter(rl.eventsPerMinute, 60000),
         health: new WindowLimiter(rl.healthPerMinute, 60000),
         invalidBearer: new FailureLock(rl.invalidBearer, rl.invalidBearerWindowMinutes * 60000, rl.invalidBearerWindowMinutes * 60000),
         account: new FailureLock(rl.accountFailures, rl.accountWindowMinutes * 60000, rl.accountWindowMinutes * 60000)
@@ -139,13 +141,18 @@ function create(webserver, parent, hooks, options) {
                 }
             }
         }
+        core.setResources(Object.assign(createStubResources(), require('./devices')(core)));
         core.state = 'ready';
     })().catch(function (err) {
         core.state = 'failed';
         console.log('Outband API failed to start: ' + (err && err.message));
     });
 
-    core.close = function () { if (core.settings) core.settings.stop(); if (core.notBefore) core.notBefore.stop(); if (core.store) core.store.close(); for (const t of core.timers) clearInterval(t); core.timers = []; };
+    core.close = function () {
+        core.bus.emit('shutdown');
+        if (core.hub && core.hub.handler && (typeof parent.RemoveEventDispatch == 'function')) { try { parent.RemoveEventDispatch(['*'], core.hub.handler); } catch (ex) { } }
+        if (core.audit) core.audit.onWrite = null;
+ if (core.settings) core.settings.stop(); if (core.notBefore) core.notBefore.stop(); if (core.store) core.store.close(); for (const t of core.timers) clearInterval(t); core.timers = []; };
     return core;
 }
 
