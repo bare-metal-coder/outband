@@ -172,21 +172,30 @@ function buildRouter(core) {
         });
     }));
 
-    // Console WebSocket (needs express-ws, present in the MeshCentral server)
+    // Console WebSocket (needs express-ws, present in the MeshCentral server). The subprotocol
+    // answered is always `outband.console.v1` (core.handleProtocols); the ticket is never echoed.
     if (typeof router.ws == 'function') {
         router.ws('/devices/:deviceId/console/:kind', async function (wsock, req) {
             const close = function (code) { try { wsock.close(code); } catch (ex) { } };
             try {
                 const deviceId = req.params.deviceId, kind = req.params.kind;
-                const binding = core.tickets.consume(Tickets.fromProtocols(req.headers['sec-websocket-protocol']), deviceId, kind);
+                if (wsock.protocol !== PROTOCOL) { close(4401); return; }
+                const binding = core.tickets.consume(Tickets.fromProtocols(req.headers['sec-websocket-protocol']), deviceId, kind); // marks the ticket used
                 if (binding == null) { close(4401); return; }
                 if (binding.cookie && !require('./hostorigin').checkOrigin(req, req.xdomain, ws.certificates, ws.args)) { close(4401); return; }
                 let ctx = null;
-                try { ctx = await resolveCredential(core, req); } catch (ex) { ctx = null; }
-                if ((ctx == null) || (ctx.credentialKey != binding.credentialKey) || (ctx.userid != binding.userid)) { close(4403); return; }
-                try { await core.resources.consoleTarget(ctx, deviceId, kind); }
-                catch (ex) { close(((ex instanceof ApiError) && (ex.status == 409)) ? 4409 : ((ex instanceof ApiError) && (ex.status == 501)) ? 1011 : 4403); return; }
-                core.audit.write({ domain: ctx.domain.id, type: 'node', action: 'outband.console.open', user: ctx.userid, userName: ctx.user.name, tokenId: ctx.token && ctx.token._id, deviceId: 'node/' + ctx.domain.id + '/' + deviceId, ip: ctx.ip, params: { kind: kind } });
+                try { ctx = await resolveCredential(core, req); } catch (ex) { ctx = null; } // a bearer ticket needs Authorization here
+                if ((ctx == null) || (ctx.credentialKey != binding.credentialKey) || (ctx.userid != binding.userid) || !ctx.hasScope('console')) { close(4403); return; }
+                const auditBase = { domain: ctx.domain.id, type: 'node', action: 'outband.console.open', user: ctx.userid, userName: ctx.user.name, tokenId: ctx.token && ctx.token._id, tokenName: ctx.token && ctx.token.name, deviceId: 'node/' + ctx.domain.id + '/' + deviceId, ip: ctx.ip, params: { kind: kind } };
+                let target;
+                try { target = await core.resources.consoleTarget(ctx, deviceId, kind); } // rights and reachability again
+                catch (ex) {
+                    const st = (ex instanceof ApiError) ? ex.status : 500;
+                    if (st == 403) core.audit.deny(ctx.credentialKey, Object.assign({}, auditBase, { reason: ex.code }));
+                    close((st == 409) ? 4409 : (st == 501) ? 1011 : 4403); return;
+                }
+                if (wsock.readyState !== 1) return;
+                core.audit.write(Object.assign({}, auditBase, { groupId: target.groupId ? ('mesh/' + ctx.domain.id + '/' + lastSegment(target.groupId)) : null }));
                 core.resources.openConsole(wsock, ctx, { deviceId: deviceId, kind: kind });
             } catch (ex) { close(1011); }
         });

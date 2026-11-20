@@ -10,6 +10,7 @@
  *   core.checkAuthCookie(cookie[, sessionRequired])  from checkAuthCookie and the relay cookie checks
  *   core.onLogout(userid, x)       from the legacy logout handler
  *   core.router()                  mounted at /api/v1
+ *   core.handleProtocols(set, req)  WebSocket subprotocol choice (the console answers outband.console.v1 only)
  * @license Apache-2.0
  */
 
@@ -24,7 +25,7 @@ const { Audit } = require('./audit');
 const { Pseudonyms } = require('./pseudonym');
 const { RuntimeSettings } = require('./settings');
 const { PendingLogins } = require('./pending');
-const { Tickets } = require('./tickets');
+const { Tickets, PROTOCOL: CONSOLE_PROTOCOL } = require('./tickets');
 const { Idempotency } = require('./idempotency');
 const { NotBefore } = require('./notbefore');
 const { WindowLimiter, FailureLock, ConcurrencyLimiter } = require('./ratelimit');
@@ -72,6 +73,17 @@ function create(webserver, parent, hooks, options) {
     core.apiDisabled = function () { return (core.config.enabled === false) || (parent.multiServer != null) || (parent.config && parent.config.peers != null); };
     core.revalidate = function (ctx) { return revalidate(core, ctx); };
     core.setResources = function (impl) { core.resources = impl; };
+    /**
+     * `handleProtocols` for MeshCentral's WebSocket server. Under /api/v1 only the console
+     * subprotocol is ever answered, so a ticket sent as a subprotocol is never echoed; every
+     * other WebSocket keeps the library default (the first protocol offered).
+     */
+    core.handleProtocols = function (protocols, req) {
+        const list = Array.isArray(protocols) ? protocols : Array.from(protocols || []); // ws 7 passes an array, ws 8 a Set
+        const path = String((req && req.url) || '').split('?')[0];
+        if (path.indexOf('/api/v1/') >= 0) return (list.indexOf(CONSOLE_PROTOCOL) >= 0) ? CONSOLE_PROTOCOL : false;
+        return list[0];
+    };
 
     core.onNewSession = function (req) {
         if ((core.sessions != null) && req && req.session) core.sessions.onNewSession(req.session.userid, req.session.x);

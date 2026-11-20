@@ -505,13 +505,13 @@ test('login and 2fa bodies and createToken secrets never reach the debug log', a
     });
 });
 
-test('power and console endpoints are typed 501 stubs behind real auth', async function () {
+test('power endpoint: real auth, body validation, 404 for an unknown device', async function () {
     await withServer({ users }, async function (h) {
         const anon = h.client();
         assert.strictEqual((await call(anon, 'GET', '/api/v1/devices')).status, 401);
         const c = await stepUpSession(h, 'alice', ALICE.password);
         const r = await call(c, 'POST', '/api/v1/devices/EXAMPLEnodeId0000/power', { json: { action: 'off' } });
-        assert.strictEqual(r.status, 501); assert.strictEqual(r.body.error.code, 'not_implemented');
+        assert.strictEqual(r.status, 404); assert.strictEqual(r.body.error.code, 'not_found');
         assert.strictEqual((await call(c, 'GET', '/api/v1/devices?limit=999')).status, 400);
         assert.strictEqual((await call(c, 'POST', '/api/v1/devices/EXAMPLEnodeId0000/power', { json: { action: 'off', bogus: 1 } })).status, 400);
     });

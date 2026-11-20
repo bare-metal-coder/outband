@@ -58,17 +58,23 @@ function mapGroup(ctx, info) {
     };
 }
 
-/** Capabilities the caller has on a device now, without dispatching anything. */
-function mapCapabilities(ctx, info) {
+/** True when Intel AMT can be reached now (CIRA, local network or relay). */
+function amtReachable(conn) { return ((conn | 0) & (CONN.CIRA | CONN.AMT | CONN.RELAY)) != 0; }
+
+/**
+ * The outband/power.js environment for one device and caller. The device
+ * capabilities and the power endpoint both use this one definition.
+ * `info`: see outband/devices.js (`nodeInfo`)
+ */
+function powerEnv(info) {
     const rights = (info.rights >>> 0);
     const conn = (info.conn | 0);
     const kind = (info.group && info.group.kind) || 'agent';
-    const amtUp = (conn & (CONN.CIRA | CONN.AMT | CONN.RELAY)) != 0;
-    const env = {
+    return {
         groupKind: kind,
         reachable: {
             agent: (conn & CONN.AGENT) != 0,
-            amt: amtUp,
+            amt: amtReachable(conn),
             wol: (info.wolPeers === true) && (kind == 'agent'),
             mqtt: (conn & CONN.MQTT) != 0,
             ipkvm: (kind == 'ipkvm') && (conn != 0)
@@ -78,9 +84,19 @@ function mapCapabilities(ctx, info) {
             return AuthContext.hasRight(rights, r.need, r.mustNot);
         }
     };
-    const caps = power.capabilities(env, function (s) { return ctx.hasScope(s); });
+}
+
+/** MeshCentral rights for a SOL console: REMOTECONTROL, and neither NOAMT nor REMOTEVIEWONLY. */
+function solAllowed(rights) { return AuthContext.hasRight(rights >>> 0, power.RIGHTS.REMOTECONTROL, power.RIGHTS.NOAMT | power.RIGHTS.REMOTEVIEWONLY); }
+
+/** SOL can be opened now: Intel AMT reachable, and not an IP-KVM group. */
+function solReachable(info) { return amtReachable(info.conn) && (((info.group && info.group.kind) || 'agent') != 'ipkvm'); }
+
+/** Capabilities the caller has on a device now, without dispatching anything. */
+function mapCapabilities(ctx, info) {
+    const caps = power.capabilities(powerEnv(info), function (s) { return ctx.hasScope(s); });
     const console_ = [];
-    if (ctx.hasScope('console') && amtUp && (kind != 'ipkvm') && AuthContext.hasRight(rights, 0x8, 0x800 | 0x100)) console_.push('sol');
+    if (ctx.hasScope('console') && solReachable(info) && solAllowed(info.rights)) console_.push('sol');
     return { power: caps.power, power_via: caps.power_via, power_paths: caps.power_paths, console: console_ };
 }
 
@@ -204,5 +220,6 @@ function mapEvent(ctx, ev) {
 
 module.exports = {
     mapDevice, mapDeviceDetail, mapEvent, mapGroup, mapRights, mapCapabilities, hardwareOf, groupKind, isAuditRecord, eventId,
+    powerEnv, solAllowed, solReachable, amtReachable,
     CONN, LIMITEVENTS, POWER_STATES
 };

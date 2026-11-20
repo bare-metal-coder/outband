@@ -1346,7 +1346,10 @@ paths:
 
         **Close codes.** `4401`: bad, used or expired ticket, or Origin
         refused. `4403`: credential ended, user locked, or rights lost.
-        `4409`: device not reachable, or busy. `1011`: server error.
+        `4409`: device not reachable, or busy. `1011`: server error. Also
+        the standard codes `1000` (idle for 15 minutes, or closed), `1008`
+        (a client that does not read its data) and `1009` (a frame over
+        16 KiB).
 
         The server opens the stream through MeshCentral's own relay (AMT
         redirection for SOL), so AMT credentials never leave the server. A

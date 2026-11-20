@@ -7168,7 +7168,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
         // Start the server, only after users and meshes are loaded from the database.
         if (obj.args.tlsoffload) {
             // Setup the HTTP server without TLS
-            obj.expressWs = require('express-ws')(obj.app, null, { wsOptions: { perMessageDeflate: (args.wscompression === true) } });
+            obj.expressWs = require('express-ws')(obj.app, null, { wsOptions: { perMessageDeflate: (args.wscompression === true), handleProtocols: obj.outband.handleProtocols } }); // Outband: console subprotocol
         } else {
             var ciphers = [
                 'TLS_AES_256_GCM_SHA384',
@@ -7218,7 +7218,7 @@ module.exports.CreateWebServer = function (parent, db, args, certificates, doneF
             //obj.tlsServer.on('tlsClientError', function (err) { console.log('tlsClientError', err); });
             obj.tlsServer.on('newSession', function (id, data, cb) { if (tlsSessionStoreCount > 1000) { tlsSessionStoreCount = 0; tlsSessionStore = {}; } tlsSessionStore[id.toString('hex')] = data; tlsSessionStoreCount++; cb(); });
             obj.tlsServer.on('resumeSession', function (id, cb) { cb(null, tlsSessionStore[id.toString('hex')] || null); });
-            obj.expressWs = require('express-ws')(obj.app, obj.tlsServer, { wsOptions: { perMessageDeflate: (args.wscompression === true) } });
+            obj.expressWs = require('express-ws')(obj.app, obj.tlsServer, { wsOptions: { perMessageDeflate: (args.wscompression === true), handleProtocols: obj.outband.handleProtocols } }); // Outband: console subprotocol
         }
 
         // Start a second agent-only server if needed
