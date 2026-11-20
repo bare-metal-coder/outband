@@ -366,7 +366,7 @@ liveTest('live MeshCentral resources: groups, devices, events, stream', { timeou
         // MeshCentral's WebSocket server: /api/v1 answers only outband.console.v1; other endpoints keep their behaviour
         const upgrade = function (p, protocols) {
             return new Promise(function (resolve) {
-                const req = https.request({ host: '127.0.0.1', port: PORT, servername: NAME, path: p, rejectUnauthorized: false, agent: false, headers: { host: HOST, cookie: cookie, origin: ORIGIN, connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-version': '13', 'sec-websocket-key': require('crypto').randomBytes(16).toString('base64'), 'sec-websocket-protocol': protocols } });
+                const req = https.request({ host: '127.0.0.1', port: PORT, servername: NAME, path: p, ca: fs.readFileSync(path.join(env.dir, 'root-cert-public.crt')), agent: false, headers: { host: HOST, cookie: cookie, origin: ORIGIN, connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-version': '13', 'sec-websocket-key': require('crypto').randomBytes(16).toString('base64'), 'sec-websocket-protocol': protocols } });
                 req.on('upgrade', function (res, sock) {
                     const proto = res.headers['sec-websocket-protocol'] || null;
                     let buf = Buffer.alloc(0);
