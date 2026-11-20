@@ -26,6 +26,11 @@ export class ApiError extends Error {
     return errorCode(this.body);
   }
 
+  /** The credential is gone (spec 401 codes), as opposed to `bearer_disabled` (retry later) or `reauth_required` (step-up). */
+  get credentialEnded(): boolean {
+    return this.status === 401 && (this.code === 'unauthenticated' || this.code === 'token_revoked' || this.code === 'token_expired' || this.code === null);
+  }
+
   /** `error.details`, e.g. `{path: 'amt'}` on a denied power path. */
   get details(): Record<string, unknown> | null {
     const e = (this.body as { error?: { details?: unknown } } | undefined)?.error;

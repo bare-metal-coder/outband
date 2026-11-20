@@ -41,6 +41,15 @@ export interface StreamOptions {
   onReconnect?: () => void;
   /** After this many failed attempts in a row, report `down` (still retrying). */
   downAfter?: number;
+  /**
+   * EventSource hides the HTTP status of a failed connect, so after an error
+   * we ask this probe (e.g. GET /session) whether to go on: `retry: false`
+   * stops for good (signed out, 403), and `afterMs` (a Retry-After) is a
+   * minimum wait. A probe that throws counts as retry.
+   */
+  probe?: () => Promise<{ retry: boolean; afterMs?: number }>;
+  /** The backoff resets only after a stream has stayed open this long (default 60 s). */
+  stableMs?: number;
   backoff?: BackoffOptions;
   factory?: EventSourceFactory;
   setTimer?: (fn: () => void, ms: number) => unknown;
@@ -78,6 +87,12 @@ export function createStream(opts: StreamOptions): Stream {
   let source: EventSourceLike | null = null;
   let timer: unknown = null;
   let attempt = 0;
+  let stableTimer: unknown = null;
+  const stableMs = opts.stableMs ?? 60_000;
+  const clearStable = () => {
+    if (stableTimer !== null) clearTimer(stableTimer);
+    stableTimer = null;
+  };
   let lastId: string | null = null;
   let closed = false;
 
@@ -106,26 +121,42 @@ export function createStream(opts: StreamOptions): Stream {
     source = es;
     es.onopen = () => {
       if (source !== es) return;
-      attempt = 0;
+      clearStable();
+      stableTimer = setTimer(() => {
+        stableTimer = null;
+        attempt = 0;
+      }, stableMs);
       setStatus('live');
       if (everLive) opts.onReconnect?.();
       everLive = true;
     };
     es.onerror = () => {
       if (source !== es) return;
+      clearStable();
       es.close();
       source = null;
-      scheduleRetry();
+      if (!opts.probe) return scheduleRetry();
+      void opts
+        .probe()
+        .catch(() => ({ retry: true }) as { retry: boolean; afterMs?: number })
+        .then((r) => {
+          if (closed) return;
+          if (!r.retry) {
+            setStatus('down');
+            return;
+          }
+          scheduleRetry(r.afterMs ?? 0);
+        });
     };
     es.onmessage = deliver('message');
     for (const type of opts.events ?? []) es.addEventListener(type, deliver(type));
   };
 
-  const scheduleRetry = () => {
+  const scheduleRetry = (minMs = 0) => {
     if (closed) return;
     attempt += 1;
     setStatus(attempt >= downAfter ? 'down' : 'connecting');
-    timer = setTimer(open, backoffDelay(attempt - 1, opts.backoff));
+    timer = setTimer(open, Math.max(minMs, backoffDelay(attempt - 1, opts.backoff)));
   };
 
   open();
@@ -139,6 +170,7 @@ export function createStream(opts: StreamOptions): Stream {
     },
     close() {
       closed = true;
+      clearStable();
       if (timer !== null) clearTimer(timer);
       timer = null;
       source?.close();

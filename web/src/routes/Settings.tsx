@@ -1,6 +1,6 @@
 /** Settings. One section for now: "API tokens" (list, create, revoke). */
 import { createMemo, createResource, createSignal, For, Show, type JSX } from 'solid-js';
-import { reauth } from '../api/auth';
+import { reauth, sendReauthCode } from '../api/auth';
 import { ApiError } from '../api/http';
 import { createToken, listTokens, revokeToken, type CreatedToken } from '../api/v1';
 import { relativeTime } from '../model/device';
@@ -44,7 +44,8 @@ async function copyText(text: string): Promise<boolean> {
 function SecretDialog(props: { created: CreatedToken; onClose: () => void }): JSX.Element {
   const [copied, setCopied] = createSignal(false);
   return (
-    <Layer onClose={props.onClose} label="New API token">
+    // Not dismissable: the secret can never be shown again, so only the button closes this.
+    <Layer onClose={props.onClose} label="New API token" dismissable={false}>
       <div class="dialog dialog-wide" data-testid="secret-dialog">
         <h2>Token created</h2>
         <p class="muted">
@@ -67,6 +68,7 @@ function SecretDialog(props: { created: CreatedToken; onClose: () => void }): JS
 /** Re-enter the password (and a second factor when asked): the spec's step-up for sensitive scopes. */
 function StepUpDialog(props: { onDone: () => void; onCancel: () => void }): JSX.Element {
   const [step, setStep] = createSignal<'password' | 'code'>('password');
+  const [methods, setMethods] = createSignal<string[]>([]);
   const [value, setValue] = createSignal('');
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
@@ -78,11 +80,12 @@ function StepUpDialog(props: { onDone: () => void; onCancel: () => void }): JSX.
       const r = await reauth(step() === 'password' ? { password: value() } : { code: value().replace(/\s+/g, '') });
       if (r.kind === 'ok') props.onDone();
       else if (r.kind === 'needs2fa') {
+        setMethods(r.methods);
         setStep('code');
         setValue('');
       } else {
         setError(r.message);
-        if (r.code === 'no_pending_login') setStep('password');
+        if (r.code === 'reauth_required') setStep('password'); // the 5 minutes for the code ran out
       }
     } finally {
       setBusy(false);
@@ -110,6 +113,13 @@ function StepUpDialog(props: { onDone: () => void; onCancel: () => void }): JSX.
             onInput={(e) => setValue(e.currentTarget.value)}
           />
         </div>
+        <Show when={step() === 'code' && methods().find((m) => m === 'email' || m === 'sms' || m === 'messaging')}>
+          {(m) => (
+            <button type="button" class="linklike" onClick={() => void sendReauthCode(m()).then((ok) => setError(ok ? null : 'Could not send a code.'))}>
+              Send me a code
+            </button>
+          )}
+        </Show>
         <div class="actions">
           <button type="button" class="btn" onClick={props.onCancel}>Cancel</button>
           <button type="submit" class="btn btn-primary" disabled={busy() || value().trim().length < (step() === 'password' ? 1 : 4)} data-testid="stepup-submit">Continue</button>

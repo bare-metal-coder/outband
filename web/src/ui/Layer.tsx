@@ -13,6 +13,8 @@ export function Layer(props: {
   role?: 'dialog' | 'alertdialog';
   children: JSX.Element;
   initialFocus?: () => HTMLElement | undefined;
+  /** false: Escape and a backdrop click do not close it (for things that must be dismissed deliberately). Default true. */
+  dismissable?: boolean;
 }): JSX.Element {
   let box!: HTMLDivElement;
   const previous = document.activeElement as HTMLElement | null;
@@ -21,7 +23,7 @@ export function Layer(props: {
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      props.onClose();
+      if (props.dismissable !== false) props.onClose();
     } else if (e.key === 'Tab') {
       const items = [...box.querySelectorAll<HTMLElement>(FOCUSABLE)];
       const first = items[0];
@@ -48,7 +50,7 @@ export function Layer(props: {
       <div
         class="scrim"
         onMouseDown={(e) => {
-          if (e.target === e.currentTarget) props.onClose();
+          if (e.target === e.currentTarget && props.dismissable !== false) props.onClose();
         }}
         onKeyDown={onKey}
       >

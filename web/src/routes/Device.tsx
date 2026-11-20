@@ -6,7 +6,7 @@
 import { createEffect, createResource, createSignal, For, on, onCleanup, Show, type JSX } from 'solid-js';
 import { ApiError } from '../api/http';
 import { getDevice, listDeviceEvents } from '../api/v1';
-import { amtLabel, availableActions, channelName, powerLabel, relativeTime, type DeviceDetail, type DeviceEvent } from '../model/device';
+import { amtLabel, availableActions, pathsName, powerLabel, relativeTime, type DeviceDetail, type DeviceEvent } from '../model/device';
 import { deviceById, onLiveEvent, upsertDevice } from '../state/devices';
 import { busy, requestPower } from '../state/power';
 import { Empty } from '../ui/Empty';
@@ -195,7 +195,7 @@ export default function Device(props: { id: string; tab?: string }): JSX.Element
                   <Icon name={a.kind === 'reset' || a.kind === 'cycle' ? 'restart' : 'power'} />
                   {a.label}
                   <Show when={a.options.length > 1}>
-                    <span class="muted mono">{a.options.map((o) => channelName(o.via)).join(' / ')}</span>
+                    <span class="muted mono">{a.options.map((o) => pathsName(o.paths) || 'default').join(' / ')}</span>
                   </Show>
                 </button>
               )}

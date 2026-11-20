@@ -141,6 +141,63 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/reauth": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-authenticate the current browser session (step-up)
+         * @description Browser session only (a bearer token gets `403 forbidden`, reason
+         *     `session_required`). Updates `last_auth`, and `last_auth_2fa`, on the
+         *     **existing** session record. It never creates a new session, never
+         *     changes the session id and never sets a cookie.
+         *
+         *     **Steps.**
+         *     1. Send `{"password": "..."}`. On success the server sets
+         *        `last_auth`. If the user has no second factor enrolled, the answer
+         *        is `204` and step-up is complete. If a second factor is enrolled,
+         *        the answer is `200` with `twofa.required: true` and the methods.
+         *     2. Send `{"code": "...", "method": "..."}` (`method` optional) within
+         *        5 minutes of step 1. On success the server sets `last_auth_2fa`
+         *        and answers `204`. To have a code sent, send
+         *        `{"method": "email", "send": true}`; the server answers `202`.
+         *
+         *     `200` means "a second factor is needed next", `202` means "a code
+         *     was sent", and `204` means "done". A code with no pending
+         *     re-authentication on this session (no step 1 in the last 5 minutes,
+         *     or discarded after 5 wrong codes) gets `401 reauth_required`. A
+         *     refused password gets `401 invalid_credentials`, and a wrong code
+         *     `401 invalid_code`. A body that mixes the steps (`password` together
+         *     with `code`, `method` or `send`; or `code` together with `send`) gets
+         *     `400 invalid_request` with `details.field` naming the field that may
+         *     not be combined.
+         *
+         *     **State.** The pending re-authentication is kept on the server,
+         *     attached to the existing session record, never in the cookie. It
+         *     expires 5 minutes after step 1 and has the same wrong-code and
+         *     code-send counters as a pending login. A new step 1 replaces it.
+         *
+         *     **Limits.** Password failures count towards the same per-account
+         *     counter and lock as login (10 in 15 minutes locks API logins and
+         *     re-authentication for 15 minutes); a locked account gets
+         *     `401 invalid_credentials`. Wrong codes count towards the same
+         *     per-user second-factor limit as `/auth/2fa`, and code sending has
+         *     the same limits. MeshCentral's per-IP ban applies (`429`). A wrong
+         *     password or code never ends the session. Needs `X-Outband: 1` and a
+         *     matching `Origin`. No `RateLimit-*` headers.
+         */
+        post: operations["reauth"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/tokens": {
         parameters: {
             query?: never;
@@ -345,12 +402,25 @@ export interface paths {
         put?: never;
         /**
          * Perform a power action
-         * @description **Paths.** With `via`, the server uses only that path. If the caller
-         *     lacks the right for that path, the answer is `403 forbidden` with
-         *     `details.path`. If the path cannot carry the action now, the answer
-         *     is `409 not_reachable`. Nothing is dispatched in either case, and the
-         *     server never falls back to another path. Without `via`, the default
-         *     path is:
+         * @description **Paths.** With `via`, the server uses only that one path, for every
+         *     action including `wake`. If the caller lacks the right for that path,
+         *     the answer is `403 forbidden` with `details.path`. If the path cannot
+         *     carry the action now, the answer is `409 not_reachable` with
+         *     `details.path`. Nothing is dispatched in either case, and the server
+         *     never falls back to another path. Allowed `via` values per action:
+         *
+         *     | Action | `via` values |
+         *     |---|---|
+         *     | `on` | `amt`, `ipkvm` |
+         *     | `wake` | `wol`, `amt`, `mqtt`, `ipkvm` |
+         *     | `off`, `reset` | `agent`, `amt`, `mqtt`, `ipkvm` (`off` only) |
+         *     | `sleep` | `agent`, `mqtt` |
+         *     | `cycle` | `amt` |
+         *
+         *     Any other combination gets `400 invalid_request` with
+         *     `details.field: via`.
+         *
+         *     Without `via`, the **default** dispatches on one or more paths:
          *     * `on`: AMT power-up (IP-KVM/PDU groups: port on).
          *     * `wake`: Wake-on-LAN from peer agents, plus AMT power-up when AMT is
          *       reachable and allowed (IP-KVM/PDU groups: port on).
@@ -361,8 +431,31 @@ export interface paths {
          *     * `sleep`: the agent.
          *     * When the device is connected over MQTT, the MQTT power message is
          *       sent along with the agent path.
-         *     `capabilities.power_via` shows each action's default path, and
-         *     `capabilities.power_paths` shows every path available now.
+         *     `capabilities.power_via` lists, per action, the paths the default
+         *     dispatches on now (an array: `wake` is often `[wol, amt]`).
+         *     `capabilities.power_paths` lists every single path that `via` can
+         *     use now.
+         *
+         *     **Default not available.** When none of an action's default paths
+         *     can carry it now, the action is left out of `capabilities.power` and
+         *     `capabilities.power_via`, and a request without `via` gets
+         *     `409 not_reachable` with `details.path` (the default path that is
+         *     missing) and `details.available_paths` (what `via` could use). The
+         *     server never switches to another path by itself. Example: the agent
+         *     is offline but AMT is reachable. `off` and `reset` are not in
+         *     `power` or `power_via`; `power_paths` has `off: [amt]` and
+         *     `reset: [amt]`; `{"action": "off"}` gets `409` with
+         *     `details: {path: agent, available_paths: [amt]}`; and
+         *     `{"action": "off", "via": "amt"}` performs a hard power-off.
+         *
+         *     **MQTT.** MQTT is never a default path on its own: it is added to
+         *     the agent path when both are connected (`power_via.off` is then
+         *     `[agent, mqtt]`). For a device reachable only over MQTT (agent
+         *     offline), the same rule applies: `off`, `reset` and `sleep` are not
+         *     in `power` or `power_via`, `power_paths` lists `mqtt` for them, a
+         *     request without `via` gets `409` with
+         *     `details: {path: agent, available_paths: [mqtt]}`, and the request
+         *     must carry `"via": "mqtt"`.
          *
          *     **Result.** MeshCentral power commands do not wait for the device, so
          *     `202` means "dispatched". The state change arrives as a
@@ -514,10 +607,14 @@ export interface paths {
          *     not listed. Generated clients must not treat the listed types as
          *     exhaustive.
          *
+         *     **Control messages.** `ready`, `resync` and `closed` are always
+         *     sent, whatever `types` says. `types` filters only the other
+         *     messages.
+         *
          *     **Recommended subscription.** Integrations that track device state
          *     should subscribe with
          *     `types=device.power,device.updated,device.removed,resync,closed`.
-         *     `ready` is always sent; `types` filters only the other messages.
+         *     UIs that show device events also need `event.created`.
          *
          *     **Visibility.** Every message passes the same rules as the REST
          *     endpoints, using the caller's rights at the moment it is sent. That
@@ -531,6 +628,38 @@ export interface paths {
          *
          *     **End.** The stream ends with `closed` (see Live updates). A
          *     credential may hold 5 concurrent streams at most.
+         *
+         *     **Reconnecting.** Each `closed` reason is either terminal or
+         *     retryable:
+         *
+         *     | Reason | Kind | Client action |
+         *     |---|---|---|
+         *     | `revoked` | terminal | Stop. The token or session was revoked. |
+         *     | `expired` | terminal | Stop. Get a new token, or log in again. |
+         *     | `locked` | terminal | Stop. The user was locked or deleted. |
+         *     | `logout` | terminal | Stop. The session logged out. |
+         *     | `disabled` | retryable | Bearer authentication is off (kill switch). Retry with backoff; requests get `401 bearer_disabled` until it is turned on. |
+         *     | `rights` | retryable | Rights changed. Reconnect with backoff; the new stream reflects the new rights. |
+         *     | `shutdown` | retryable | The server is restarting. Reconnect with backoff. |
+         *
+         *     Unknown reasons are retryable. When a reconnect is answered with an
+         *     error instead of a stream:
+         *     * `401 unauthenticated`: stop. Browsers go to the login page (for
+         *       example, the session passed its lifetime limit or was logged out
+         *       elsewhere). Integrations stop and report the token as not
+         *       recognised.
+         *     * `401 token_revoked` or `401 token_expired`, or any `403`: stop.
+         *     * `401 bearer_disabled`, `429` or `503`: retry on the schedule
+         *       below (honour `Retry-After` when present).
+         *
+         *     **Retry timing.** Every client, including browser `EventSource`
+         *     (which applies `retry:` itself but does not expose it to scripts),
+         *     should use the same schedule for retryable ends, dropped
+         *     connections and reconnects made by hand: wait 5 seconds plus a
+         *     random 0 to 5 seconds, double the base after each failed attempt up
+         *     to 60 seconds, and reset it after a stream has stayed open for 60
+         *     seconds. Browsers that rely on `EventSource`'s own reconnect should
+         *     close it on a terminal `closed` reason.
          */
         get: operations["streamEvents"];
         put?: never;
@@ -652,6 +781,18 @@ export interface components {
             twofa: components["schemas"]["SessionTwoFactor"];
         };
         LoginResult: components["schemas"]["LoginSuccess"] | components["schemas"]["LoginPending"];
+        /** @description Step 1: `password` alone. Step 2: `code` (optionally with `method`), or `method` with `send: true`. Exactly one step per request; a mixed body gets `400 invalid_request` with `details.field`. */
+        ReauthRequest: {
+            password?: string;
+            code?: string;
+            /** @enum {string} */
+            method?: "otp" | "backup" | "email" | "sms" | "messaging" | "yubikey";
+            /** @description Ask the server to send a code (`email`, `sms`, `messaging`). */
+            send?: boolean;
+        };
+        ReauthPending: {
+            twofa: components["schemas"]["SessionTwoFactor"];
+        };
         SecondFactorRequest: {
             code?: string;
             /** @enum {string} */
@@ -775,13 +916,13 @@ export interface components {
         };
         /** @description What the caller can do now, given scope, rights and reachability. */
         DeviceCapabilities: {
-            /** @description Actions available with their default path. */
+            /** @description Actions whose default (no `via`) can be dispatched now. An action whose default paths are all unavailable is left out, even when `power_paths` still lists a path for it (see `powerAction`). */
             power: components["schemas"]["PowerAction"][];
-            /** @description Each available action's default path, for example `agent` (graceful) or `amt` (hard). */
+            /** @description For each action in `power`, the paths its default dispatches on now, for example `[agent]` (graceful off) or `[wol, amt]` (wake). */
             power_via?: {
-                [key: string]: components["schemas"]["PowerPath"];
+                [key: string]: components["schemas"]["PowerPath"][];
             };
-            /** @description Every path each action can take now, for use with `via`. The first entry is the default. */
+            /** @description Every single path each action can take now with `via`. May list actions that are not in `power`. */
             power_paths?: {
                 [key: string]: components["schemas"]["PowerPath"][];
             };
@@ -803,6 +944,15 @@ export interface components {
             /** Format: date-time */
             last_seen: string | null;
             capabilities: components["schemas"]["DeviceCapabilities"];
+            links?: components["schemas"]["DeviceLinks"];
+        };
+        /** @description Optional links for this device. Clients must not build these paths themselves. */
+        DeviceLinks: {
+            /**
+             * @description Path of the device page in the Outband web UI, relative to the server origin, for example `/devices/<id>`. Join it with the origin the client already uses. It carries no credential.
+             * @example /devices/EXAMPLEnodeId00000000000000000000000000000000000000000000000000
+             */
+            ui?: string;
         };
         DevicePage: {
             items: components["schemas"]["Device"][];
@@ -833,7 +983,7 @@ export interface components {
             /** @enum {string} */
             action: "on" | "off" | "reset" | "cycle" | "sleep" | "wake";
             /**
-             * @description Use only this path, with no fallback. `403` with `details.path` if the right for it is missing; `409` if it cannot carry the action now.
+             * @description Use only this one path (also for `wake`), with no fallback. See `powerAction` for the values allowed per action. `403` with `details.path` if the right for it is missing; `409` with `details.path` if it cannot carry the action now.
              * @enum {string}
              */
             via?: "agent" | "amt" | "wol" | "mqtt" | "ipkvm";
@@ -951,7 +1101,7 @@ export interface components {
              */
             type: "closed";
             data: {
-                /** @description `disabled`: bearer authentication was turned off. */
+                /** @description `disabled`: bearer authentication was turned off. Terminal: `revoked`, `expired`, `locked`, `logout`. Retryable: `disabled`, `rights`, `shutdown`, and any unknown reason (see `streamEvents`). */
                 reason: string;
             };
         };
@@ -983,7 +1133,19 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description No valid credential (`unauthenticated`), an expired or revoked token (`token_expired`, `token_revoked`), or step-up needed (`reauth_required`). */
+        /**
+         * @description The `code` tells bearer clients what happened:
+         *     * `unauthenticated`: no credential, or one the server does not
+         *       recognise (unknown token, ended session);
+         *     * `token_revoked`: the token was revoked, or its owner was deleted,
+         *       locked or changed their password. Do not retry with this token;
+         *     * `token_expired`: the token is past its expiry. Do not retry with
+         *       this token;
+         *     * `bearer_disabled`: an administrator turned bearer authentication
+         *       off (kill switch). The token itself is still valid; retry later
+         *       with backoff;
+         *     * `reauth_required`: step-up needed (browser sessions).
+         */
         Unauthorized: {
             headers: {
                 "WWW-Authenticate"?: string;
@@ -1151,7 +1313,7 @@ export interface operations {
                      *       "name": "Outband",
                      *       "version": "1.3.1",
                      *       "outband_version": "0.1.0",
-                     *       "api_version": "1.0.0-draft.5",
+                     *       "api_version": "1.0.0-draft.7",
                      *       "features": {
                      *         "amt": true,
                      *         "twofa": {
@@ -1337,6 +1499,75 @@ export interface operations {
                 content?: never;
             };
             403: components["responses"]["Forbidden"];
+            421: components["responses"]["InvalidHost"];
+            429: components["responses"]["RateLimited"];
+            503: components["responses"]["ServiceUnavailable"];
+            default: components["responses"]["DefaultError"];
+        };
+    };
+    reauth: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description CSRF guard. Required for cookie-authenticated requests that are not GET or HEAD. */
+                "X-Outband"?: components["parameters"]["XOutband"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReauthRequest"];
+            };
+        };
+        responses: {
+            /** @description Password accepted; a second factor is also required. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "twofa": {
+                     *         "required": true,
+                     *         "methods": [
+                     *           "otp",
+                     *           "email"
+                     *         ],
+                     *         "expires_at": "2026-01-01T12:05:00Z"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ReauthPending"];
+                };
+            };
+            /** @description A code was sent through the requested method. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Re-authenticated; step-up is satisfied for 15 minutes. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description `unauthenticated` (no valid session), `invalid_credentials`, `invalid_code`, or `reauth_required` (a code with no pending re-authentication). */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            403: components["responses"]["Forbidden"];
+            415: components["responses"]["UnsupportedMediaType"];
             421: components["responses"]["InvalidHost"];
             429: components["responses"]["RateLimited"];
             503: components["responses"]["ServiceUnavailable"];
@@ -1769,10 +2000,18 @@ export interface operations {
                      *               "cycle"
                      *             ],
                      *             "power_via": {
-                     *               "off": "agent",
-                     *               "reset": "agent",
-                     *               "sleep": "agent",
-                     *               "cycle": "amt"
+                     *               "off": [
+                     *                 "agent"
+                     *               ],
+                     *               "reset": [
+                     *                 "agent"
+                     *               ],
+                     *               "sleep": [
+                     *                 "agent"
+                     *               ],
+                     *               "cycle": [
+                     *                 "amt"
+                     *               ]
                      *             },
                      *             "power_paths": {
                      *               "off": [
@@ -1904,7 +2143,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
-            /** @description No path can carry the action now, or the requested `via` path cannot (`not_reachable`); or `idempotency_conflict`. Nothing was dispatched. */
+            /** @description The default paths, or the requested `via` path, cannot carry the action now (`not_reachable`, with `details.path` and, without `via`, `details.available_paths`); or `idempotency_conflict`. Nothing was dispatched. */
             409: {
                 headers: {
                     [name: string]: unknown;

@@ -79,6 +79,7 @@ const MESSAGES: Record<string, string> = {
   invalid_code: 'That code was not accepted. Check it and try again.',
   no_pending_login: 'Your sign-in expired. Enter your password again.',
   rate_limited: 'Too many attempts. Wait a minute and try again.',
+  reauth_required: 'Enter your password again first.',
   csrf_failed: 'The server rejected this request. Reload the page and try again.',
   unavailable: 'The Outband API is not available on this server.',
   invalid_host: 'This address is not one the server is configured for.',
@@ -128,14 +129,13 @@ export async function verify2fa(code: string, method?: string): Promise<LoginRes
 export type ReauthResult = { kind: 'ok' } | { kind: 'needs2fa'; methods: string[] } | { kind: 'error'; code: string; message: string };
 
 /**
- * Step-up: re-check the password, then a second factor when the user has one,
- * on the EXISTING session (no new session is created). Planned for spec
- * draft.6 as `POST /auth/reauth`, cookie session only, body `{password}` then
- * `{code}`, answering 204 when done or 401. How "a code is needed next" is
- * signalled is not final: we read a pending-2FA body (`twofa.required`) on a
- * 2xx. If the spec differs, only this function changes.
+ * Step-up (spec `reauth`, draft.6): re-check the password, then a second
+ * factor when the user has one, on the EXISTING session (no new session or
+ * cookie). Step 1 `{password}`: 204 when done, or 200 with `twofa.required`
+ * and the methods. Step 2 `{code[, method]}` within 5 minutes: 204.
+ * `{method, send: true}`: 202. Wire details stay in this function.
  */
-export async function reauth(step: { password: string } | { code: string }): Promise<ReauthResult> {
+export async function reauth(step: { password: string } | { code: string; method?: string }): Promise<ReauthResult> {
   try {
     const body = await request<{ twofa?: WireTwoFactor } | undefined>('POST', authPaths.reauth, { body: step });
     if (body?.twofa?.required) return { kind: 'needs2fa', methods: body.twofa.methods ?? [] };
@@ -143,6 +143,16 @@ export async function reauth(step: { password: string } | { code: string }): Pro
   } catch (err) {
     const r = failure(err, 'That was not accepted.');
     return r.kind === 'error' ? r : { kind: 'error', code: 'unexpected', message: 'That was not accepted.' };
+  }
+}
+
+/** Have a step-up code sent (email, SMS or messaging). */
+export async function sendReauthCode(method: string): Promise<boolean> {
+  try {
+    await request<void>('POST', authPaths.reauth, { body: { method, send: true } });
+    return true;
+  } catch {
+    return false;
   }
 }
 

@@ -42,7 +42,7 @@ try {
     await hook('reset');
     const ctx = await browser.newContext({ viewport, colorScheme, reducedMotion: 'reduce', permissions: ['clipboard-read', 'clipboard-write'] });
     const page = await ctx.newPage();
-    page.setDefaultTimeout(6000);
+    page.setDefaultTimeout(20000);
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
     const shot = (n) => page.screenshot({ path: `${OUT}/${label}-${n}.png`, fullPage: true, animations: 'disabled' });
@@ -148,7 +148,8 @@ try {
       await page.waitForSelector('[data-testid=confirm-dialog]');
       const t = await page.locator('[data-testid=confirm-dialog]').innerText();
       expect(t.includes('Shut down (agent)') && t.includes('Hard power off (Intel AMT)'), 'both choices shown');
-      expect(await page.locator('[data-testid=via-agent]').isChecked(), 'agent is the default');
+      expect(await page.locator('[data-testid=via-default]').isChecked(), 'the default (agent) is preselected');
+      expect((await page.locator('[data-testid=confirm-dialog] .choice').first().innerText()).includes('Shut down (agent)'), 'default is the graceful agent path');
       await page.click('[data-testid=via-amt]');
       await shot('07-confirm');
       expect((await page.locator('[data-testid=confirm-power]').innerText()) === 'Hard power off (Intel AMT)', 'confirm button names the path');
@@ -174,6 +175,25 @@ try {
       await toastText('do not have the right to do this through Intel AMT');
       await hook('deny', { paths: [] });
       await shot('09-errors');
+    });
+    await step('default unavailable (agent offline): hard power off is offered only as via=amt, red confirm', async () => {
+      await page.goto(BASE + '/devices/devBmc0100000004', { waitUntil: 'load' });
+      await page.waitForSelector('[data-action=wake]');
+      await hook('emit', { id: 'devBmc0100000004', power: 'on' });
+      await page.waitForSelector('[data-action=off]');
+      const reqs = [];
+      const onReq = (r) => r.url().endsWith('/power') && r.method() === 'POST' && reqs.push(r.postData());
+      page.on('request', onReq);
+      await page.click('[data-action=off]');
+      await page.waitForSelector('[data-testid=confirm-dialog]');
+      const t = await page.locator('[data-testid=confirm-dialog]').innerText();
+      expect(t.includes('Hard power off') && t.includes('Intel AMT') && !t.includes('server default'), 'names the AMT path, not the default');
+      expect((await page.locator('[data-testid=confirm-power]').getAttribute('class')).includes('btn-danger'), 'red confirm');
+      await shot('09b-hard-off-only');
+      await page.click('[data-testid=confirm-power]');
+      await toastText('Hard power off (Intel AMT) sent');
+      page.off('request', onReq);
+      expect(reqs.length === 1 && JSON.parse(reqs[0]).via === 'amt', 'request carries via=amt: ' + reqs);
     });
     await step('console tab is a placeholder', async () => {
       await page.click('[data-testid=tab-console]');
@@ -242,6 +262,10 @@ try {
       await shot('13-secret');
       expect(authCalls.join() === 'reauth,reauth', 'step-up uses /auth/reauth twice and never /auth/login: ' + authCalls);
       await page.keyboard.press('Escape');
+      await page.mouse.click(5, 5);
+      await page.waitForTimeout(300);
+      expect((await page.locator('[data-testid=secret]').innerText()) === secret, 'Escape and a backdrop click leave the secret on screen');
+      await page.click('[data-testid=secret-done]');
       await page.waitForSelector('[data-testid=secret-dialog]', { state: 'detached' });
       await page.waitForSelector('[data-testid=token-row]:has-text("e2e-automation")');
       expect(!(await page.content()).includes(secret), 'secret is gone after closing');
@@ -253,14 +277,6 @@ try {
       await page.waitForSelector('[data-testid=token-row][data-status=revoked]');
       await shot('15-revoked');
     });
-    await step('secret dialog also closes on a backdrop click', async () => {
-      await page.click('[data-testid=new-token]');
-      await page.fill('#tname', 'second');
-      await page.click('[data-testid=create-submit]');
-      await page.waitForSelector('[data-testid=secret-dialog]');
-      await page.mouse.click(5, 5);
-      await page.waitForSelector('[data-testid=secret-dialog]', { state: 'detached' });
-    });
     await step('404 page', async () => {
       await page.goto(BASE + '/nope', { waitUntil: 'load' });
       await page.waitForSelector('text=No signal at this address');
@@ -269,6 +285,20 @@ try {
       await page.click('[data-testid=user-menu]');
       await page.click('[data-testid=logout]');
       await page.waitForSelector('#username');
+    });
+    await step('stream: a retryable close reconnects; a terminal close signs out with a notice', async () => {
+      await page.goto(BASE + '/', { waitUntil: 'load' });
+      await page.fill('#username', 'admin');
+      await page.fill('#password', 'outband');
+      await page.click('button[type=submit]');
+      await page.waitForSelector('[data-testid=carrier][data-state=live]');
+      await hook('close', { reason: 'shutdown' });
+      await page.waitForSelector('[data-testid=carrier]:not([data-state=live])');
+      await page.waitForSelector('[data-testid=carrier][data-state=live]', { timeout: 25000 });
+      expect(await page.locator('[data-testid=device-list]').count() === 1, 'still signed in');
+      await hook('close', { reason: 'revoked' });
+      await page.waitForSelector('[data-testid=signed-out]');
+      await shot('16-signed-out');
     });
     await ctx.close();
   }

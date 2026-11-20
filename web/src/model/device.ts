@@ -32,12 +32,14 @@ export interface Device {
   lastSeen: string | null;
   /**
    * What the server says the caller may do now (rights, scope, reachability).
-   * `via` is each action's default path; `paths` every path available now
-   * (first entry is the default). Both can be empty on older servers.
+   * `via`: per action, the paths its default (no `via`) dispatches on now.
+   * An action whose default is unavailable is absent from `power` and `via`.
+   * `paths`: every single path `via` can use now (may list actions that are
+   * not in `power`, e.g. a hard power-off when the agent is offline).
    */
   can: {
     power: PowerKind[];
-    via: Partial<Record<PowerKind, Channel>>;
+    via: Partial<Record<PowerKind, Channel[]>>;
     paths: Partial<Record<PowerKind, Channel[]>>;
     console: string[];
   };
@@ -74,7 +76,13 @@ export interface DeviceEvent {
 
 /** One way to carry out an action: the unit the confirm dialog offers. */
 export interface PowerOption {
-  via: Channel;
+  /**
+   * The `via` to send: exactly one path. `null` sends no `via`, so the server
+   * uses the action's default, which may dispatch on several paths.
+   */
+  via: Channel | null;
+  /** The paths this option goes out on (the default's paths, or the one chosen). Empty when unknown. */
+  paths: Channel[];
   /** Names the action and the path, e.g. "Hard power off (Intel AMT)". */
   label: string;
   detail: string;
@@ -87,18 +95,15 @@ export interface PowerAction {
   /** Short button label. */
   label: string;
   destructive: boolean;
-  /** Always at least one. The first is the server's default path. */
+  /** Always at least one. The default (when available) comes first. */
   options: PowerOption[];
-  /**
-   * True when the request carries `via`, so the server uses exactly the path
-   * the user confirmed (never a fallback). False for `wake` (its default is a
-   * combination of Wake-on-LAN and AMT) and when the server gave no path info.
-   */
-  explicitVia: boolean;
 }
 
 export const channelName = (c: Channel | string): string =>
   ({ agent: 'agent', amt: 'Intel AMT', wol: 'Wake-on-LAN', mqtt: 'MQTT', ipkvm: 'IP-KVM / PDU' })[c as Channel] ?? c;
+
+/** "Intel AMT", or "Wake-on-LAN + Intel AMT". */
+export const pathsName = (paths: readonly Channel[]): string => paths.map(channelName).join(' + ');
 
 const BUTTON: Record<PowerKind, string> = {
   on: 'Power on',
@@ -117,63 +122,75 @@ const ORDER: PowerKind[] = ['on', 'wake', 'sleep', 'reset', 'cycle', 'off'];
 const KNOWN_CHANNELS: readonly Channel[] = ['agent', 'amt', 'wol', 'mqtt', 'ipkvm'];
 
 /**
- * Describe one (action, path) pair the way the server will carry it out.
- * `off` and `reset` through the agent are graceful; through AMT (or an
- * IP-KVM/PDU port) they are hard. `cycle` is always a hard AMT cycle.
+ * Describe an action carried out on `paths`. `off` and `reset` are graceful on
+ * the agent (or MQTT) and hard on AMT or an IP-KVM/PDU port; `cycle` is always
+ * a hard AMT cycle. `only` marks a single path picked out of a multi-path default.
  */
-export function describeOption(kind: PowerKind, via: Channel | null): PowerOption {
-  const at = via ? ` (${channelName(via)})` : '';
-  const hard = via !== null && via !== 'agent' && via !== 'mqtt';
+export function describeOption(kind: PowerKind, paths: readonly Channel[], via: Channel | null, only = false): PowerOption {
+  const at = paths.length ? ` (${pathsName(paths)})` : '';
+  const hard = paths.some((p) => p === 'amt' || p === 'ipkvm');
+  const base = { via, paths: [...paths] };
   switch (kind) {
     case 'on':
-      return { via: via ?? 'amt', label: `Power on${at}`, detail: `Power on through ${channelName(via ?? 'amt')}.`, graceful: false };
+      return { ...base, label: `Power on${at}`, detail: `Power on through ${paths.length ? pathsName(paths) : 'Intel AMT'}.`, graceful: false };
     case 'wake':
       return {
-        via: via ?? 'wol',
+        ...base,
         label: `Wake${at}`,
-        detail:
-          via === 'wol'
-            ? 'Send Wake-on-LAN through peer agents.'
-            : via
-              ? `Power up through ${channelName(via)}.`
-              : 'Send Wake-on-LAN through peer agents, plus an AMT power-up when AMT is reachable.',
+        detail: only ? `Use ${pathsName(paths)} only.` : `Send ${paths.length ? pathsName(paths) : 'Wake-on-LAN, plus an AMT power-up when AMT is reachable'}.`,
         graceful: false,
       };
     case 'sleep':
-      return { via: via ?? 'agent', label: `Sleep${at}`, detail: 'Ask the OS to sleep through the agent.', graceful: true };
+      return { ...base, label: `Sleep${at}`, detail: 'Ask the OS to sleep.', graceful: true };
     case 'cycle':
-      return { via: via ?? 'amt', label: `Power cycle${at}`, detail: 'Hard power off, then on again, through Intel AMT. Unsaved work is lost.', graceful: false };
+      return { ...base, label: `Power cycle${at}`, detail: 'Hard power off, then on again, through Intel AMT. Unsaved work is lost.', graceful: false };
     case 'off':
       return hard
-        ? { via: via ?? 'amt', label: `Hard power off${at}`, detail: 'Cuts power in hardware. The OS is not shut down cleanly and unsaved work is lost.', graceful: false }
-        : { via: via ?? 'agent', label: `Shut down${at}`, detail: 'Asks the OS to shut down cleanly through the agent.', graceful: true };
+        ? { ...base, label: `Hard power off${at}`, detail: 'Cuts power in hardware. The OS is not shut down cleanly and unsaved work is lost.', graceful: false }
+        : { ...base, label: `Shut down${at}`, detail: 'Asks the OS to shut down cleanly.', graceful: true };
     case 'reset':
       return hard
-        ? { via: via ?? 'amt', label: `Hard reset${at}`, detail: 'Resets the machine in hardware. The OS is not restarted cleanly and unsaved work is lost.', graceful: false }
-        : { via: via ?? 'agent', label: `Restart${at}`, detail: 'Asks the OS to restart cleanly through the agent.', graceful: true };
+        ? { ...base, label: `Hard reset${at}`, detail: 'Resets the machine in hardware. The OS is not restarted cleanly and unsaved work is lost.', graceful: false }
+        : { ...base, label: `Restart${at}`, detail: 'Asks the OS to restart cleanly.', graceful: true };
   }
 }
 
-/** Build the action: its paths come from `power_paths`, else `power_via`, else the spec's defaults. */
+const known = (list: readonly string[] | undefined): Channel[] => (list ?? []).filter((c): c is Channel => KNOWN_CHANNELS.includes(c as Channel));
+
+/**
+ * Build the choices for one action.
+ * - Default available (`power_via`): first the default (no `via`; the server
+ *   dispatches on exactly those paths), then every other single path from
+ *   `power_paths` (sent as `via`, one path).
+ * - Default unavailable (absent from `power`): only the single paths in
+ *   `power_paths`, each sent as `via`. Never a request without `via`, which
+ *   the server would refuse with 409.
+ * - No path information at all (old server): one default option, no `via`.
+ */
 function buildAction(d: Device, kind: PowerKind): PowerAction {
-  const known = (list: readonly string[] | undefined): Channel[] =>
-    (list ?? []).filter((c): c is Channel => KNOWN_CHANNELS.includes(c as Channel));
-  let paths = known(d.can.paths[kind]);
-  if (!paths.length && d.can.via[kind]) paths = [d.can.via[kind]!];
-  // Without path info, describe the default path the spec gives for the action.
-  const options = paths.length ? paths.map((p) => describeOption(kind, p)) : [describeOption(kind, null)];
-  return { kind, label: BUTTON[kind], destructive: DESTRUCTIVE.has(kind), options, explicitVia: paths.length > 0 && kind !== 'wake' };
+  const def = known(d.can.via[kind]);
+  const paths = known(d.can.paths[kind]);
+  const options: PowerOption[] = [];
+  if (d.can.power.includes(kind)) options.push(describeOption(kind, def, null));
+  const single = def.length === 1 ? def[0] : null;
+  for (const p of paths) {
+    if (p === single) continue; // already the default
+    options.push(describeOption(kind, [p], p, def.length > 1));
+  }
+  if (!options.length) options.push(describeOption(kind, [], null));
+  return { kind, label: BUTTON[kind], destructive: DESTRUCTIVE.has(kind), options };
 }
 
 /**
- * Power actions to offer now: the server's capabilities, narrowed by the
- * current power state so we never offer "on" for a running machine or
- * "off" for one that is already off. With an unknown state, all of the
- * server's capabilities are offered.
+ * Power actions to offer now: what the server says is possible (default
+ * available, or reachable through some single path), narrowed by the current
+ * power state so we never offer "on" for a running machine or "off" for one
+ * that is already off. With an unknown state, everything possible is offered.
  */
 export function availableActions(d: Device): PowerAction[] {
   const wantsOn = (k: PowerKind) => k === 'on' || k === 'wake';
-  return ORDER.filter((k) => d.can.power.includes(k))
+  const possible = (k: PowerKind) => d.can.power.includes(k) || known(d.can.paths[k]).length > 0;
+  return ORDER.filter(possible)
     .filter((k) => {
       if (d.power === 'on') return !wantsOn(k);
       if (d.power === 'off') return wantsOn(k);

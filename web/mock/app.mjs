@@ -9,6 +9,7 @@
 //   deny {paths:[...]}         server-side deny these paths for power (403 forbidden)
 //   event {id, message}        push an event.created for a device
 //   unknown {}                 push an event of a type no client knows
+//   close {reason}             end all streams with `closed` (terminal reasons also end sessions)
 //   age-session                make sessions' last_auth stale (forces step-up)
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -185,22 +186,34 @@ export function createMock(opts = {}) {
     const caller = users[s.user.name];
 
     if (p === '/api/v1/auth/reauth' && m === 'POST') {
-      // Step-up on the existing session: {password}, then {code} when the user has a second factor. No new session.
+      // Step-up on the existing session (draft.6): {password} -> 204, or 200 {twofa} when a second factor is
+      // enrolled; then {code[,method]} within 5 minutes -> 204; {method,send:true} -> 202. No new session, no cookie.
       const b = await readBody(req);
-      if (b === null || Object.keys(b).length !== 1 || !('password' in b || 'code' in b)) return err(res, 400, 'invalid_request', 'Send {password} or {code}');
+      const keys = b ? Object.keys(b) : [];
+      const bad = (field) => err(res, 400, 'invalid_request', 'Exactly one step per request', { field });
+      if (!b || !keys.length) return bad('body');
+      if (keys.some((k) => !['password', 'code', 'method', 'send'].includes(k))) return bad(keys.find((k) => !['password', 'code', 'method', 'send'].includes(k)));
+      if ('password' in b && keys.length > 1) return bad(keys.find((k) => k !== 'password')); // password stands alone
+      if ('code' in b && b.send) return bad('send');
+      if ('send' in b && b.send !== true) return bad('send');
+      if (!('password' in b) && !('code' in b) && !b.send) return bad('method');
+      if (b.send) {
+        if (!s.reauthPw || Date.now() - s.reauthPw > 300_000) return err(res, 401, 'reauth_required', 'Enter your password first');
+        return json(res, 202, undefined);
+      }
       if ('password' in b) {
         if (b.password !== caller.password) return err(res, 401, 'invalid_credentials', 'Invalid password');
         s.lastAuth = Date.now();
         if (caller.twofa) {
-          s.reauthPw = true;
-          return json(res, 202, { twofa: { required: true, methods: ['otp', 'email'] } });
+          s.reauthPw = Date.now();
+          return json(res, 200, { twofa: { required: true, methods: ['otp', 'email'], expires_at: new Date(Date.now() + 300_000).toISOString() } });
         }
         res.writeHead(204);
         return res.end();
       }
-      if (!s.reauthPw) return err(res, 401, 'no_pending_login', 'Enter your password first');
+      if (!s.reauthPw || Date.now() - s.reauthPw > 300_000) return err(res, 401, 'reauth_required', 'Enter your password first');
       if (b.code !== OTP) return err(res, 401, 'invalid_code', 'Invalid code');
-      s.reauthPw = false;
+      s.reauthPw = 0;
       s.lastAuth2fa = Date.now();
       res.writeHead(204);
       return res.end();
@@ -321,10 +334,20 @@ export function createMock(opts = {}) {
       return json(res, 202, prev.result);
     }
     const caps = capabilitiesFor(d, caller);
-    const allowedPaths = caps.power_paths[b.action] ?? [];
-    if (b.via && (caller.deny.includes(b.via) || denyPaths.includes(b.via))) return err(res, 403, 'forbidden', 'Not allowed on this path', { path: b.via });
-    const paths = b.via ? (allowedPaths.includes(b.via) ? [b.via] : []) : allowedPaths.length ? [b.action === 'off' || b.action === 'reset' ? (allowedPaths.includes('agent') ? 'agent' : null) : allowedPaths[0]].filter(Boolean) : [];
-    if (!paths.length) return err(res, 409, 'not_reachable', 'No path can carry this action now');
+    const VIA_FOR = { on: ['amt', 'ipkvm'], wake: ['wol', 'amt', 'mqtt', 'ipkvm'], off: ['agent', 'amt', 'mqtt', 'ipkvm'], reset: ['agent', 'amt', 'mqtt'], sleep: ['agent', 'mqtt'], cycle: ['amt'] };
+    if (b.via && !VIA_FOR[b.action].includes(b.via)) return err(res, 400, 'invalid_request', 'via is not valid for this action', { field: 'via' });
+    let paths;
+    if (b.via) {
+      if (caller.deny.includes(b.via) || denyPaths.includes(b.via)) return err(res, 403, 'forbidden', 'Not allowed on this path', { path: b.via });
+      if (!(caps.power_paths[b.action] ?? []).includes(b.via)) return err(res, 409, 'not_reachable', 'That path cannot carry the action now', { path: b.via });
+      paths = [b.via];
+    } else {
+      paths = caps.power_via[b.action];
+      if (!paths) {
+        const DEFAULT_PATH = { on: 'amt', wake: 'wol', off: 'agent', reset: 'agent', sleep: 'agent', cycle: 'amt' };
+        return err(res, 409, 'not_reachable', 'The default path cannot carry the action now', { path: DEFAULT_PATH[b.action], available_paths: caps.power_paths[b.action] ?? [] });
+      }
+    }
     const log = (powerLog.get(d.id) ?? []).filter((t) => Date.now() - t < 60_000);
     if (log.length >= 6) return err(res, 429, 'rate_limited', 'Too many power actions on this device', undefined, { 'Retry-After': '30' });
     log.push(Date.now());
@@ -347,6 +370,16 @@ export function createMock(opts = {}) {
     if (name === 'reset') reset();
     else if (name === 'age-session') for (const x of sessions.values()) x.lastAuth = x.lastAuth2fa = 0;
     else if (name === 'deny') denyPaths = b.paths ?? [];
+    else if (name === 'close') {
+      // End every stream with `closed {reason}`. Terminal reasons also end the sessions.
+      const reason = b.reason ?? 'shutdown';
+      for (const c of [...streams]) {
+        c.res.write(`event: closed\nid: ${++seq}\ndata: ${JSON.stringify({ type: 'closed', data: { reason } })}\n\n`);
+        c.res.end();
+        streams.delete(c);
+      }
+      if (['revoked', 'expired', 'locked', 'logout'].includes(reason)) sessions.clear();
+    }
     else if (name === 'unknown') broadcast('device.firmware', { id: b.id ?? 'devWeb0100000001', version: '9.9' });
     else if (!d) return err(res, 404, 'not_found', 'no device');
     else if (name === 'emit') {

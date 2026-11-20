@@ -78,11 +78,27 @@ describe('mock: devices and power', () => {
     const b = await call('POST', '/api/v1/devices/devWeb0100000001/power', { cookie: c, body: { action: 'off', via: 'amt' } });
     expect(b.json.paths).toEqual(['amt']);
   });
+  it('default unavailable: off is absent from power and power_via, listed in power_paths; no via gets 409 with the paths, via=amt works', async () => {
+    const c = await signIn();
+    const d = (await call('GET', '/api/v1/devices/devBmc0100000004', { cookie: c })).json.capabilities;
+    expect(d.power).not.toContain('off');
+    expect(d.power_via.off).toBeUndefined();
+    expect(d.power_paths.off).toEqual(['amt']);
+    expect(d.power_via.wake).toEqual(['wol', 'amt']);
+    const r = await call('POST', '/api/v1/devices/devBmc0100000004/power', { cookie: c, body: { action: 'off' } });
+    expect(r.status).toBe(409);
+    expect(r.json.error).toMatchObject({ code: 'not_reachable', details: { path: 'agent', available_paths: ['amt'] } });
+    const ok = await call('POST', '/api/v1/devices/devBmc0100000004/power', { cookie: c, body: { action: 'off', via: 'amt' } });
+    expect(ok.status).toBe(202);
+    expect(ok.json.paths).toEqual(['amt']);
+    const bad = await call('POST', '/api/v1/devices/devBmc0100000004/power', { cookie: c, body: { action: 'cycle', via: 'agent' } });
+    expect(bad.json.error.details.field).toBe('via');
+  });
   it('409 not_reachable when the path cannot carry it, 403 forbidden with details.path when the right is missing', async () => {
     const c = await signIn();
     const r = await call('POST', '/api/v1/devices/devNas0100000002/power', { cookie: c, body: { action: 'off', via: 'amt' } });
     expect(r.status).toBe(409);
-    expect(r.json.error.code).toBe('not_reachable');
+    expect(r.json.error).toMatchObject({ code: 'not_reachable', details: { path: 'amt' } });
     const g = await signIn('guest');
     const f = await call('POST', '/api/v1/devices/devWeb0100000001/power', { cookie: g, body: { action: 'off', via: 'amt' } });
     expect(f.status).toBe(403);
@@ -127,13 +143,26 @@ describe('mock: tokens and step-up', () => {
     // Step-up on the same session: password (202: code needed), wrong code, right code (204). No new cookie.
     expect((await call('POST', '/api/v1/auth/reauth', { cookie: c, body: { password: 'nope' } })).json.error.code).toBe('invalid_credentials');
     const pw = await call('POST', '/api/v1/auth/reauth', { cookie: c, body: { password: 'outband' } });
-    expect(pw.status).toBe(202);
-    expect(pw.json.twofa.required).toBe(true);
+    expect(pw.status).toBe(200);
+    expect(pw.json.twofa).toMatchObject({ required: true, methods: ['otp', 'email'] });
     expect(pw.cookie).toBeUndefined();
     expect((await create(c, { name: 'p2', profile: 'device_power' })).json.error.code).toBe('reauth_required'); // not done yet
+    expect((await call('POST', '/api/v1/auth/reauth', { cookie: c, body: { method: 'email', send: true } })).status).toBe(202);
     expect((await call('POST', '/api/v1/auth/reauth', { cookie: c, body: { code: '000000' } })).json.error.code).toBe('invalid_code');
     expect((await call('POST', '/api/v1/auth/reauth', { cookie: c, body: { code: '123456' } })).status).toBe(204);
     expect((await create(c, { name: 'p2', profile: 'device_power' })).status).toBe(201);
+  });
+  it('a code without a recent password check gets reauth_required', async () => {
+    const c = await signIn('ops');
+    expect((await call('POST', '/api/v1/auth/reauth', { cookie: c, body: { code: '123456' } })).json.error.code).toBe('reauth_required');
+  });
+  it('a mixed reauth body is 400 invalid_request naming the field', async () => {
+    const c = await signIn('admin');
+    for (const [body, field] of [[{ password: 'outband', code: '123456' }, 'code'], [{ password: 'outband', send: true }, 'send'], [{ code: '123456', send: true }, 'send']] as const) {
+      const r = await call('POST', '/api/v1/auth/reauth', { cookie: c, body });
+      expect(r.status).toBe(400);
+      expect(r.json.error).toMatchObject({ code: 'invalid_request', details: { field } });
+    }
   });
   it('reauth needs a session, and works without a second factor for users who have none', async () => {
     expect((await call('POST', '/api/v1/auth/reauth', { body: { password: 'outband' } })).status).toBe(401);

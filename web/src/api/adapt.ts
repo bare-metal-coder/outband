@@ -25,13 +25,12 @@ const isChannel = (c: unknown): c is Channel => CHANNELS.includes(c as Channel);
 
 /** Open enums: unknown actions and paths are dropped, never guessed. */
 function adaptCapabilities(c: WireDevice['capabilities'] | undefined): Device['can'] {
-  const via: Device['can']['via'] = {};
-  for (const [k, v] of Object.entries(c?.power_via ?? {})) if (isKind(k) && isChannel(v)) via[k] = v;
-  const paths: Device['can']['paths'] = {};
-  for (const [k, v] of Object.entries(c?.power_paths ?? {})) {
-    if (isKind(k) && Array.isArray(v)) paths[k] = v.filter(isChannel);
-  }
-  return { power: (c?.power ?? []).filter(isKind), via, paths, console: [...(c?.console ?? [])] };
+  const lists = (o: Record<string, unknown> | undefined): Partial<Record<PowerKind, Channel[]>> => {
+    const out: Partial<Record<PowerKind, Channel[]>> = {};
+    for (const [k, v] of Object.entries(o ?? {})) if (isKind(k) && Array.isArray(v)) out[k] = v.filter(isChannel);
+    return out;
+  };
+  return { power: (c?.power ?? []).filter(isKind), via: lists(c?.power_via), paths: lists(c?.power_paths), console: [...(c?.console ?? [])] };
 }
 
 export function adaptPower(state: string | undefined | null): Power {
@@ -147,7 +146,7 @@ export type LiveUpdate =
   | { kind: 'removed'; id: string }
   | { kind: 'event'; event: DeviceEvent }
   | { kind: 'resync' }
-  | { kind: 'closed'; reason: string }
+  | { kind: 'closed'; reason: string; terminal: boolean }
   | { kind: 'ready' };
 
 /**
@@ -158,6 +157,9 @@ export type LiveUpdate =
  */
 export const STREAM_TYPES = ['ready', 'device.updated', 'device.power', 'device.removed', 'event.created', 'resync', 'closed'] as const;
 export type KnownStreamType = (typeof STREAM_TYPES)[number];
+
+/** `closed` reasons after which the client must stop (the credential is gone). Others, and unknown ones, are retryable. */
+export const TERMINAL_CLOSE = ['revoked', 'expired', 'locked', 'logout'] as const;
 
 export const isKnownStreamType = (t: unknown): t is KnownStreamType => STREAM_TYPES.includes(t as KnownStreamType);
 
@@ -179,7 +181,10 @@ export function adaptStream(data: unknown): LiveUpdate | null {
     case 'resync':
       return { kind: 'resync' };
     case 'closed':
-      return { kind: 'closed', reason: typeof body?.reason === 'string' ? body.reason : 'unknown' };
+    {
+      const reason = typeof body?.reason === 'string' ? body.reason : 'unknown';
+      return { kind: 'closed', reason, terminal: (TERMINAL_CLOSE as readonly string[]).includes(reason) };
+    }
     case 'device.updated':
       return body && typeof body.id === 'string' ? { kind: 'device', device: adaptDevice(body as unknown as WireDevice) } : null;
     case 'device.power': {

@@ -30,7 +30,10 @@ function Routes(): JSX.Element {
 export function App(): JSX.Element {
   onMount(() => void refreshSession());
   setUnauthorizedHandler(markSignedOut);
-  setClosedHandler(() => void refreshSession());
+  setClosedHandler((reason, terminal) => {
+    if (terminal) markSignedOut(reason);
+    else void refreshSession(); // retryable: the stream reconnects by itself; check we are still signed in
+  });
 
   const authed = () => session()?.authenticated === true;
   createEffect(() => {

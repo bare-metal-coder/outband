@@ -103,24 +103,34 @@ export function makeFixtures() {
   return { groups, devices, detail, events, nextEventId: () => n++ };
 }
 
-/** What `caller` may do with a device now, as `capabilities` (scope, rights and reachability). */
+/**
+ * What `caller` may do with a device now, as `capabilities` (draft.6).
+ * `power_paths`: every single path `via` can use. `power_via`: the paths each
+ * action's DEFAULT dispatches on; an action whose default is unavailable is
+ * left out of `power` and `power_via` but may still be in `power_paths`
+ * (hard off when the agent is offline).
+ */
 export function capabilitiesFor(d, caller) {
   const denied = caller?.deny ?? [];
   const agent = d.online;
   const amt = d.amt.reachable && !denied.includes('amt');
   const paths = {};
+  const via = {};
+  if (amt) paths.on = via.on = ['amt'];
+  paths.wake = ['wol', ...(amt ? ['amt'] : [])];
+  via.wake = [...paths.wake];
+  if (agent) paths.sleep = via.sleep = ['agent'];
   const hard = [...(agent ? ['agent'] : []), ...(amt ? ['amt'] : [])];
-  if (amt) paths.on = ['amt'];
-  paths.wake = ['wol'];
-  if (agent) paths.sleep = ['agent'];
   if (hard.length) {
-    paths.off = hard;
-    paths.reset = hard;
+    paths.off = [...hard];
+    paths.reset = [...hard];
+    if (agent) {
+      via.off = ['agent'];
+      via.reset = ['agent'];
+    }
   }
-  if (amt) paths.cycle = ['amt'];
-  const power = Object.keys(paths);
-  const via = Object.fromEntries(power.map((k) => [k, paths[k][0]]));
-  return { power, power_via: via, power_paths: paths, console: amt ? d.console : [] };
+  if (amt) paths.cycle = via.cycle = ['amt'];
+  return { power: Object.keys(via), power_via: via, power_paths: paths, console: amt ? d.console : [] };
 }
 
 /** A device as the API sends it. `redactIps` models a read-only token. */

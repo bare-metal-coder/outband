@@ -7,6 +7,7 @@ import { batch, createMemo, createSignal } from 'solid-js';
 import { createStore, reconcile } from 'solid-js/store';
 import { adaptStream, STREAM_TYPES, type LiveUpdate } from '../api/adapt';
 import { ApiError } from '../api/http';
+import { getSession } from '../api/auth';
 import { createStream, type Stream, type StreamStatus } from '../api/stream';
 import { listAllDevices, listGroups, streamUrl } from '../api/v1';
 import type { Device, DeviceEvent, Group } from '../model/device';
@@ -42,8 +43,8 @@ export function setUnauthorizedHandler(fn: () => void): void {
   onUnauthorized = fn;
 }
 
-let onClosed: () => void = () => {};
-export function setClosedHandler(fn: () => void): void {
+let onClosed: (reason: string, terminal: boolean) => void = () => {};
+export function setClosedHandler(fn: (reason: string, terminal: boolean) => void): void {
   onClosed = fn;
 }
 
@@ -57,7 +58,7 @@ export async function reload(): Promise<void> {
       setLoaded(true);
     });
   } catch (err) {
-    if (err instanceof ApiError && err.status === 401) return onUnauthorized();
+    if (err instanceof ApiError && err.credentialEnded) return onUnauthorized();
     setLoadError(err instanceof Error ? err.message : 'Could not load devices');
     setLoaded(true);
   }
@@ -89,8 +90,9 @@ export function apply(u: LiveUpdate): void {
       void reload();
       break;
     case 'closed':
-      // The server ended the stream (revoked, logout, expired, ...). Find out whether we are still signed in.
-      onClosed();
+      // Terminal reasons (revoked, expired, locked, logout): stop for good. Others are retried with backoff.
+      if (u.terminal) stream?.close();
+      onClosed(u.reason, u.terminal);
       break;
     case 'ready':
       break;
@@ -106,8 +108,24 @@ export function start(): void {
     url: streamUrl,
     events: [...STREAM_TYPES],
     onStatus: setStreamStatus,
-    // The server asks clients to wait 5s before reconnecting (`retry: 5000`).
-    backoff: { baseMs: 5000 },
+    // After a failed connect: signed out (401 unauthenticated) means stop and go to login; 429/503 honour Retry-After.
+    probe: async () => {
+      try {
+        const s = await getSession();
+        if (!s.authenticated) {
+          onUnauthorized();
+          return { retry: false };
+        }
+        return { retry: true };
+      } catch (err) {
+        if (err instanceof ApiError && err.credentialEnded) {
+          onUnauthorized();
+          return { retry: false };
+        }
+        if (err instanceof ApiError && err.status === 403) return { retry: false };
+        return { retry: true, afterMs: err instanceof ApiError && err.retryAfter ? err.retryAfter * 1000 : 0 };
+      }
+    },
     onReconnect: () => void reload(),
     onMessage: (m) => {
       const u = adaptStream(m.data);

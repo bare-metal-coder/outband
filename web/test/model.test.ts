@@ -24,14 +24,14 @@ describe('adapt', () => {
   });
   it('maps a wire device with capabilities and paths', () => {
     expect(web).toMatchObject({ name: 'web01', online: true, power: 'on', groupName: 'Lab', amt: { state: 'reachable', via: 'local' } });
-    expect(web!.can.via.off).toBe('agent');
+    expect(web!.can.via.off).toEqual(['agent']);
     expect(web!.can.paths.off).toEqual(['agent', 'amt']);
   });
   it('copes with absent ips and unknown enum values', () => {
-    const w = { ...wire('web01'), ips: undefined, capabilities: { power: ['off', 'levitate'], power_via: { off: 'agent', levitate: 'agent', reset: 'carrier-pigeon' }, power_paths: { off: ['agent', 'telepathy'] }, console: ['sol', 'x'] } };
+    const w = { ...wire('web01'), ips: undefined, capabilities: { power: ['off', 'levitate'], power_via: { off: ['agent'], levitate: ['agent'], reset: ['carrier-pigeon'] }, power_paths: { off: ['agent', 'telepathy'] }, console: ['sol', 'x'] } };
     const d = adaptDevice(w as never);
     expect(d.ips).toEqual([]);
-    expect(d.can).toEqual({ power: ['off'], via: { off: 'agent' }, paths: { off: ['agent'] }, console: ['sol', 'x'] });
+    expect(d.can).toEqual({ power: ['off'], via: { off: ['agent'], reset: [] }, paths: { off: ['agent'] }, console: ['sol', 'x'] });
   });
   it('hides a redacted actor and keeps the outcome', () => {
     const base = { id: 'e1', time: 't', type: 'node', action: 'a', message: 'm', token_id: null, token_name: null, device_id: null, group_id: null };
@@ -54,7 +54,9 @@ describe('stream messages', () => {
     expect(adaptStream(env('device.removed', { id: 'a' }))).toEqual({ kind: 'removed', id: 'a' });
     expect(adaptStream(env('resync', {}))).toEqual({ kind: 'resync' });
     expect(adaptStream(env('ready', { server_time: 't' }))).toEqual({ kind: 'ready' });
-    expect(adaptStream(env('closed', { reason: 'logout' }))).toEqual({ kind: 'closed', reason: 'logout' });
+    expect(adaptStream(env('closed', { reason: 'logout' }))).toEqual({ kind: 'closed', reason: 'logout', terminal: true });
+    for (const r of ['revoked', 'expired', 'locked']) expect(adaptStream(env('closed', { reason: r }))).toMatchObject({ terminal: true });
+    for (const r of ['disabled', 'rights', 'shutdown', 'something-new']) expect(adaptStream(env('closed', { reason: r }))).toMatchObject({ terminal: false });
     expect(adaptStream(env('device.updated', wire('web01')))).toMatchObject({ kind: 'device', device: { name: 'web01' } });
   });
   it('ignores unknown types (StreamOther) and malformed messages', () => {
@@ -71,38 +73,51 @@ describe('stream messages', () => {
   });
 });
 
-describe('power actions', () => {
-  const kinds = (d: typeof web) => availableActions(d!).map((a) => `${a.kind}:${a.options.map((o) => o.via).join('+')}`);
-  it('running agent + AMT: off and reset offer the agent first, then AMT', () => {
-    expect(kinds(web)).toEqual(['sleep:agent', 'reset:agent+amt', 'cycle:amt', 'off:agent+amt']);
+describe('power actions (draft.6 capabilities)', () => {
+  const kinds = (d: typeof web) => availableActions(d!).map((a) => `${a.kind}:${a.options.map((o) => o.via ?? 'default').join('+')}`);
+  it('running agent + AMT: the default first (no via), then the AMT path as via=amt', () => {
+    expect(kinds(web)).toEqual(['sleep:default', 'reset:default+amt', 'cycle:default', 'off:default+amt']);
     const off = availableActions(web!).find((a) => a.kind === 'off')!;
     expect(off.options.map((o) => o.label)).toEqual(['Shut down (agent)', 'Hard power off (Intel AMT)']);
     expect(off.options.map((o) => o.graceful)).toEqual([true, false]);
-    expect(off.explicitVia).toBe(true);
+    expect(off.options.map((o) => o.via)).toEqual([null, 'amt']);
   });
-  it('agent only (nas01): one graceful path; no AMT choice', () => {
-    expect(kinds(nas)).toEqual(['sleep:agent', 'reset:agent', 'off:agent']);
+  it('agent only (nas01): one graceful default; no AMT choice', () => {
+    expect(kinds(nas)).toEqual(['sleep:default', 'reset:default', 'off:default']);
   });
-  it('AMT-only machine that is off: power on or wake', () => {
-    expect(kinds(amtOnly)).toEqual(['on:amt', 'wake:wol']);
-    expect(availableActions(amtOnly!).find((a) => a.kind === 'wake')!.explicitVia).toBe(false);
+  it('AMT-only machine that is off: power on, and wake with the default plus each single path', () => {
+    expect(kinds(amtOnly)).toEqual(['on:default', 'wake:default+wol+amt']);
+    const wake = availableActions(amtOnly!).find((a) => a.kind === 'wake')!;
+    expect(wake.options.map((o) => o.label)).toEqual(['Wake (Wake-on-LAN + Intel AMT)', 'Wake (Wake-on-LAN)', 'Wake (Intel AMT)']);
+    expect(wake.options[0]!.paths).toEqual(['wol', 'amt']);
+  });
+  it('default unavailable (agent offline, AMT reachable): off and reset are offered only through via=amt', () => {
     const onNow = { ...amtOnly!, power: 'on' as const };
-    expect(kinds(onNow)).toEqual(['reset:amt', 'cycle:amt', 'off:amt']);
-    expect(availableActions(onNow).find((a) => a.kind === 'off')!.options[0]).toMatchObject({ label: 'Hard power off (Intel AMT)', graceful: false });
+    expect(onNow.can.power).not.toContain('off');
+    expect(onNow.can.paths.off).toEqual(['amt']);
+    expect(kinds(onNow)).toEqual(['reset:amt', 'cycle:default', 'off:amt']);
+    const off = availableActions(onNow).find((a) => a.kind === 'off')!;
+    expect(off.options).toHaveLength(1);
+    expect(off.options[0]).toMatchObject({ via: 'amt', label: 'Hard power off (Intel AMT)', graceful: false });
+    expect(off.destructive).toBe(true);
+  });
+  it('MQTT-only device: off is offered only as via=mqtt (spec draft.7)', () => {
+    const m = { ...nas!, can: { power: [], via: {}, paths: { off: ['mqtt' as const] }, console: [] } };
+    const off = availableActions(m).find((a) => a.kind === 'off')!;
+    expect(off.options).toEqual([expect.objectContaining({ via: 'mqtt', label: 'Shut down (MQTT)' })]);
   });
   it('a user without the AMT right is never offered an AMT path', () => {
-    const g = dev('web01', users.guest);
-    expect(kinds(g)).toEqual(['sleep:agent', 'reset:agent', 'off:agent']);
+    expect(kinds(dev('web01', users.guest))).toEqual(['sleep:default', 'reset:default', 'off:default']);
   });
   it('offline machine: only wake. Sleeping machine: no sleep', () => {
-    expect(kinds(old)).toEqual(['wake:wol']);
-    expect(kinds(edge)).toEqual(['wake:wol', 'reset:agent', 'off:agent']);
+    expect(kinds(old)).toEqual(['wake:default']);
+    expect(kinds(edge)).toEqual(['wake:default', 'reset:default', 'off:default']);
   });
-  it('never offers what the server does not allow, and falls back to spec defaults without path info', () => {
+  it('never offers what the server does not allow; with no path info it sends no via', () => {
     expect(kinds({ ...nas!, can: { power: [], via: {}, paths: {}, console: [] } })).toEqual([]);
     const bare = availableActions({ ...nas!, can: { power: ['off'], via: {}, paths: {}, console: [] } });
-    expect(bare[0]).toMatchObject({ explicitVia: false });
-    expect(bare[0]!.options[0]!.label).toBe('Shut down');
+    expect(bare[0]!.options).toHaveLength(1);
+    expect(bare[0]!.options[0]).toMatchObject({ via: null, label: 'Shut down' });
   });
 });
 

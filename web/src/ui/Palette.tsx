@@ -1,5 +1,5 @@
 import { createMemo, createSignal, For, Show, type JSX } from 'solid-js';
-import { availableActions, channelName, matches, type Device, type PowerAction } from '../model/device';
+import { availableActions, matches, pathsName, type Device, type PowerAction } from '../model/device';
 import { navigate } from '../router';
 import { devices, groupName } from '../state/devices';
 import { busy, requestPower } from '../state/power';
@@ -123,7 +123,7 @@ export function Palette(): JSX.Element {
                         <>
                           <span>{a().action.label}</span>
                           <span class="muted">{a().device.name}</span>
-                          <span class="hint state">{a().action.options.map((o) => channelName(o.via)).join(' / ')}</span>
+                          <span class="hint state">{a().action.options.map((o) => pathsName(o.paths) || 'default').join(' / ')}</span>
                         </>
                       )}
                     </Show>

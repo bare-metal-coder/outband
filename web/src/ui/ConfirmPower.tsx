@@ -1,5 +1,5 @@
 import { For, Show, type JSX } from 'solid-js';
-import { channelName } from '../model/device';
+import { channelName, pathsName } from '../model/device';
 import { cancelConfirm, choice, confirmPending, pending, setChoice } from '../state/power';
 import { Layer } from './Layer';
 
@@ -28,8 +28,16 @@ export function ConfirmPower(): JSX.Element {
                     <p class="muted">{opt().detail}</p>
                     <p class="muted" style={{ 'margin-top': '10px' }}>
                       Path:{' '}
-                      <Show when={p().action.explicitVia} fallback={<span data-testid="path-default">server default (usually <span class="state">{channelName(opt().via)}</span>)</span>}>
-                        <span class="state">{channelName(opt().via)}</span>
+                      <Show
+                        when={opt().via === null}
+                        fallback={<span class="state">{channelName(opt().via!)}</span>}
+                      >
+                        <span data-testid="path-default">
+                          server default
+                          <Show when={opt().paths.length}>
+                            {' '}(usually <span class="state">{pathsName(opt().paths)}</span>)
+                          </Show>
+                        </span>
                       </Show>
                     </p>
                   </>
@@ -39,11 +47,11 @@ export function ConfirmPower(): JSX.Element {
                   <For each={p().action.options}>
                     {(o, i) => (
                       <label class="choice" data-checked={String(choice() === i())}>
-                        <input type="radio" name="power-via" checked={choice() === i()} onChange={() => setChoice(i())} data-testid={`via-${o.via}`} />
+                        <input type="radio" name="power-via" checked={choice() === i()} onChange={() => setChoice(i())} data-testid={`via-${o.via ?? 'default'}`} />
                         <span>
                           <span class="choice-label">
                             {o.label}
-                            <Show when={i() === 0}>
+                            <Show when={o.via === null}>
                               <span class="state"> default</span>
                             </Show>
                           </span>

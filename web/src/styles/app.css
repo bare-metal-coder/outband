@@ -1216,3 +1216,11 @@ legend {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+.notice {
+  padding: 10px 12px;
+  border-radius: var(--r);
+  border: 1px solid var(--line-strong);
+  background: var(--raised);
+  color: var(--text);
+}

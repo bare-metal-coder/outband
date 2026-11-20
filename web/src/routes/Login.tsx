@@ -1,7 +1,7 @@
 import { createSignal, Show, type JSX } from 'solid-js';
 import { login, send2faCode, verify2fa, type LoginResult } from '../api/auth';
 import { BrandMark } from '../ui/Icon';
-import { refreshSession, session } from '../state/session';
+import { refreshSession, session, setSignedOutReason, signedOutReason } from '../state/session';
 
 const METHOD_HINT: Record<string, string> = {
   otp: 'the code from your authenticator app',
@@ -24,6 +24,7 @@ export function Login(): JSX.Element {
 
   const handle = async (r: LoginResult) => {
     if (r.kind === 'ok') {
+      setSignedOutReason(null);
       await refreshSession();
     } else if (r.kind === 'needs2fa') {
       setMethods(r.methods);
@@ -64,6 +65,9 @@ export function Login(): JSX.Element {
           <p class="muted">{step() === 'password' ? 'Out-of-band management for your machines.' : hint()}</p>
         </div>
         <form class="panel auth-form" onSubmit={submit} novalidate>
+          <Show when={signedOutReason() && !error()}>
+            <div class="notice" role="status" data-testid="signed-out">{signedOutReason()}</div>
+          </Show>
           <Show when={error()}>
             <div class="alert" role="alert" data-testid="login-error">
               {error()}
