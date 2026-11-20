@@ -1,82 +1,81 @@
-# MeshCentral
+# Outband
 
-## Table of Contents
+**Status: alpha.** The API is a draft (`1.0.0-draft.N`) and may change in
+breaking ways until 1.0.0. Do not expose an alpha build to the internet.
 
-[About](#about)
-[Social Media](#social-media)
-[Documentation](#documentation)
-[Video Tutorials](#video-tutorials)
-[Community Meetings](#community-meetings)
-[Feedback](#feedback)
-[Unofficial Chatrooms](#unofficial-chatrooms)
-[Archive PDFs](#archive-pdfs)
-[License](#license)
+Outband is a fork of [MeshCentral](https://github.com/Ylianst/MeshCentral)
+that adds a public, versioned HTTP API (`/api/v1`) with API tokens, and a
+new web UI built on that API. Under the hood it is MeshCentral: the same
+database, agents, permission model, Intel AMT support, power control and
+relays. The existing MeshCentral UI stays available alongside it.
 
-## About
-MeshCentral is a full computer management web site. With MeshCentral, you can run your own web server to remotely manage and control computers on a local network or anywhere on the internet. Once you get the server started, create device group and download and install an agent on each computer you want to manage. A minute later, the new computer will show up on the web site and you can take control of it. MeshCentral includes full web-based remote desktop, terminal and file management capability.
+MeshCentral is the work of Ylian Saint-Hilaire and the MeshCentral
+contributors. Outband would not exist without it. See [NOTICE](NOTICE).
 
-For more information, [visit MeshCentral.com](https://meshcentral.com).
+## The API
 
-## Social Media
-[YouTube](https://www.youtube.com/channel/UCJWz607A8EVlkilzcrb-GKg/videos)
-[Reddit](https://www.reddit.com/r/MeshCentral/)
-[BlogSpot](https://meshcentral2.blogspot.com/)
-[LinkedIn](https://www.linkedin.com/groups/13067101/)
+* Specification: [`api/openapi.yaml`](api/openapi.yaml) (OpenAPI 3.1).
+* Browser sessions (`/api/v1/auth/login`, with two-factor login), and API
+  tokens for machine clients (`Authorization: Bearer obt_…`), with scopes,
+  expiry, group and address restrictions, and a runtime kill switch.
+* Server-side session records with an absolute lifetime and a persisted
+  revocation list, which apply to the legacy UI as well.
+* Strict Host and Origin checks, CSRF protection, no CORS, rate limits, log
+  redaction, and an Outband audit log with its own retention.
 
-## Documentation
-[New Searchable Documentation](https://ylianst.github.io/MeshCentral/) is available here and contains information every administrator should know including usage, the server configuration file, databases, TLS offloading, Let's Encrypt, IP Filtering, Email setup, embedding, server port aliasing, reverse proxy setup, multi factor authentication, branding & terms of use, HashiCorp Vault support, and SSO.
+The implementation lives in [`outband/`](outband/). Resource endpoints are
+built on the interface described in
+[`outband/CONTRIBUTING-API.md`](outband/CONTRIBUTING-API.md).
 
-The [Design and Architecture Guide](https://meshcentral.com/docs/MeshCentral2DesignArchitecture.pdf) is a short document that includes information on the design overview, dependencies, source code descriptions of each file, certificates, TLS security, the agent to server handshake, browser to agent relay and WebRTC and the messenger service.
+## Quick start (Docker)
 
-## Video Tutorials
-You can watch many tutorial videos on the [MeshCentral YouTube Channel](https://www.youtube.com/channel/UCJWz607A8EVlkilzcrb-GKg/videos). Two videos to get started involve installation and basic usages.
+```sh
+docker run -d --name outband \
+  -p 443:443 \
+  -e DYNAMIC_CONFIG=true \
+  -e HOSTNAME=outband.example.com \
+  -v outband-data:/opt/meshcentral/meshcentral-data \
+  ghcr.io/bare-metal-coder/outband:master
+```
 
-Installing MeshCentral on Windows, Linux and macOS.  
-[![MeshCentral - Installation](https://img.youtube.com/vi/GsQbWZmRRAU/mqdefault.jpg)](https://www.youtube.com/watch?v=GsQbWZmRRAU)
+Then open `https://outband.example.com/` and create the first account,
+which becomes the site administrator. The API needs a real server name:
+set `HOSTNAME` (or `cert` / a domain `dns` in `config.json`) to the name
+clients use (`DYNAMIC_CONFIG=true` applies the environment to
+`config.json` at every start). The image is built from [`docker/Dockerfile`](docker/Dockerfile);
+see [`docker/README.md`](docker/README.md) for every option.
 
-Basic Usages including installing the agent and remote desktop, terminal and file access.  
-[![MeshCentral - Basics](https://img.youtube.com/vi/D9Q7M7PdTg0/mqdefault.jpg)](https://www.youtube.com/watch?v=D9Q7M7PdTg0)
+API settings go under `settings.outbandApi` in `config.json`:
 
-MeshCentral support for two-factor authentication.  
-[![MeshCentral - Two Factor Authentication](https://img.youtube.com/vi/luLZKcma9l0/mqdefault.jpg)](https://www.youtube.com/watch?v=luLZKcma9l0)
+```json
+{
+  "settings": {
+    "outbandApi": {
+      "sessionLifetimeHours": 12,
+      "auditRetentionDays": 365,
+      "bearer": true
+    }
+  }
+}
+```
 
-How to setup MeshCentral with the NGINX reverse proxy.  
-[![MeshCentral - NGINX Reverse Proxy](https://img.youtube.com/vi/YSmiLyKSX2I/mqdefault.jpg)](https://www.youtube.com/watch?v=YSmiLyKSX2I)
+## Development
 
-Installing and using the MeshCentral Android agent.  
-[![MeshCentral - Android](https://img.youtube.com/vi/wi1HYdW00Bk/mqdefault.jpg)](https://www.youtube.com/watch?v=wi1HYdW00Bk)
+```sh
+npm ci
+npm test                    # in-process tests and spec contract checks
+OUTBAND_LIVE=1 npm test     # also runs a real server on 127.0.0.1:4431 (throwaway data in .outband-test/)
+ln -s ../../scripts/pre-push .git/hooks/pre-push   # gitleaks before every push
+```
 
-Using MeshCentral Router to port map TCP connections.  
-[![MeshCentral - Basics](https://img.youtube.com/vi/BubeVRmbCRM/mqdefault.jpg)](https://www.youtube.com/watch?v=BubeVRmbCRM)
+Node.js 22 or later is required.
 
-## Community Meetings
-Join our monthly community meetings to stay updated with the latest MeshCentral developments, ask questions, and connect with other users and developers.
+## MeshCentral documentation
 
-- [Watch past meeting recordings](https://videos.evoludata.com/w/p/tUnLpw6z1LCASuATa7wnCo)
-- [Learn more about our monthly meetings](https://github.com/Ylianst/MeshCentral/wiki/Community-Monthly-Meetings)
-
-## Feedback
-If you encounter a problem or have a suggestion to improve the product, you may file an [issue report](https://github.com/Ylianst/MeshCentral/issues/)
-
-If you are filing a problem report, you should include:
-* The version of the software you are using
-* The operating system and version
-* The observed output
-* The expected output
-* Any troubleshooting you took to resolve the issue yourself
-* Any other similar reports
-
-If you are having issues with the following other products, you should file a report on their respective issue pages
-[MeshAgent](https://github.com/Ylianst/MeshAgent/issues)
-[MeshRouter](https://github.com/Ylianst/MeshCentralRouter/issues)
-
-## Unofficial chatrooms
-- Discord Server: https://discord.gg/8wHC6ASWAc
-- Telegram Channel: https://t.me/meshcentral
-
-## Archive PDFs
-[User's Guide](https://meshcentral.com/docs/MeshCentral2UserGuide.pdf)
-[Installation Guide](https://meshcentral.com/docs/MeshCentral2InstallGuide.pdf)
+Everything about running MeshCentral (configuration, databases, TLS
+offloading, agents, Intel AMT) applies to Outband:
+[MeshCentral documentation](https://ylianst.github.io/MeshCentral/).
 
 ## License
-This software is licensed under [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

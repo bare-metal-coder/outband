@@ -1,0 +1,27 @@
+Outband
+Copyright the Outband project contributors.
+
+Outband is a fork of MeshCentral (https://github.com/Ylianst/MeshCentral),
+Copyright Ylian Saint-Hilaire, Intel Corporation and the MeshCentral
+contributors, licensed under the Apache License, Version 2.0.
+
+This product includes software developed by the MeshCentral project. The
+original copyright, license and attribution notices in the MeshCentral
+source files are retained.
+
+Files modified by the Outband project carry the line "Modified by the
+Outband project" in their header comment, or are listed here when their
+format has no comments:
+  - package.json, package-lock.json (scripts, development dependencies,
+    repository URL)
+  - .gitignore, .dockerignore (test data directory)
+  - .github/workflows: upstream release and image workflows moved to
+    .github/upstream-workflows-disabled/ so they do not run in this fork
+
+New files under outband/, api/, test/outband/, scripts/ and
+.github/workflows/outband-ci.yml are part of Outband and licensed under the
+Apache License, Version 2.0.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use these files except in compliance with the License. You may obtain a copy
+of the License at http://www.apache.org/licenses/LICENSE-2.0

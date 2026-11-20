@@ -314,3 +314,7 @@ __pycache__/
 docs/__pycache__/
 docs/env/
 docker-compose.yaml
+public/app/
+
+## Outband: throwaway test data directories
+.outband-test/

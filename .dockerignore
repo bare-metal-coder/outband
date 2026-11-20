@@ -12,3 +12,4 @@ docs/
 *.md
 examples
 tests
+.outband-test/
